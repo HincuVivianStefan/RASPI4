@@ -687,7 +687,7 @@ SPLIT_PEAK = 0.6    # vârfurile hărții de distanțe (× maximul) care conteaz
 HALF_ASPECT = (1.6, 2.6)   # o pată respinsă cu raportul ăsta poate fi două fețe lipite: încercăm jumătățile
 
 
-def find_cubes(frame, corners=None):
+def find_cubes(frame, corners=None, ref=None):
     """Caută cuburile ca obiecte: pete de culoare de mărimea unui cub, aproape pătrate și pline.
     Petele mai mici decât un cub sunt zgomot și se ignoră. Întoarce (cuburi, respinse);
     fiecare e un dict cu color, center, box, angle, area (× celulă), aspect, fill, reason.
@@ -698,7 +698,8 @@ def find_cubes(frame, corners=None):
     hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
     h, w = small.shape[:2]
     # Mărimea de referință: o celulă a caroiajului; fără caroiaj, ~1/50 din imagine.
-    ref = cv2.contourArea(np.float32(corners)) * s * s / 9 if corners else h * w / 50
+    # ref = fără caroiaj, mărimea unui cub ca fracțiune din imagine (de aproape, deasupra cubului, e mult mai mare).
+    ref = cv2.contourArea(np.float32(corners)) * s * s / 9 if corners else h * w * (ref or 1 / 50)
     P = cam = to_table = None
     if corners:
         to_table = cv2.getPerspectiveTransform(np.float32(corners), np.float32([[0, 0], [3, 0], [3, 3], [0, 3]]))

@@ -26,6 +26,7 @@ from . import aim
 from . import config as C
 from . import hat
 from . import pad
+from . import pick
 from . import overlay
 from . import planner
 from . import tasks
@@ -331,6 +332,7 @@ class Runner:
         self.stop_ev = threading.Event()
         self.cont_ev = threading.Event()
         self.on_memorize = lambda colors: None   # App: afișează aranjarea memorată de Pasul 1
+        self.memory = None   # ce a memorat Pasul 1 (caroiaj, unghiuri, culori), pentru „Pune cuburile înapoi”
         self.clear()
 
     def clear(self):
@@ -408,58 +410,94 @@ class Runner:
         n = sum(c is not None for row in colors for c in row)
         self.log(f"Cuburi memorate:\n{tasks.grid_text(colors)}")
         self.notify(f"Am găsit caroiajul cu cuburi și l-am memorat: {n} cuburi.", ["Caroiaj gasit!", "Memorat: %d cuburi" % n])
-        return {"grid": grid, "angles": angles, "colors": colors}   # Pasul 2 (self.step2) vine după
+        # Cât de mare e o celulă în imagine: la scanare, cuburile din jur au cam aceeași mărime.
+        corners, (w, h) = self.look()["corners"], self.look()["size"]
+        cell = cv2.contourArea(np.float32(corners)) / 9 / (w * h) if corners else None
+        return {"grid": grid, "angles": angles, "colors": colors, "cell": cell}
 
-    def step2(self, rob, grid, look, memorized):
-        """Pasul 2: așteaptă să dispară toate cuburile de pe caroiaj, apoi se uită stânga / dreapta după ele."""
-        left, empty_votes = None, 0
-        while empty_votes < 2:      # de două ori la rând gol (fiecare = vot pe STABLE_FRAMES cadre)
-            rob.check()
-            try:
-                colors = self.detect(grid)
-            except RuntimeError:    # o mână acoperă caroiajul: încercăm din nou
-                rob.sleep(0.5)
-                continue
-            n = sum(c is not None for row in colors for c in row)
-            empty_votes = empty_votes + 1 if n == 0 else 0
-            if n != left and n:
-                self.log(f"Mai sunt {n} cuburi pe caroiaj; aștept să fie luate.")
-            left = n
-        self.notify("Caroiajul e gol. Caut cuburile stânga / dreapta.", ["Caroiaj gol", "Caut cuburile"])
+    def memorize_only(self, rob):
+        """Butonul „Sarcina 1: găsește și memorează”: Pasul 1, apoi brațul așteaptă butonul „Pune cuburile înapoi”."""
+        s1 = self.step1(rob)
+        if not any(any(row) for row in s1["colors"]):
+            raise RuntimeError("Nu am memorat niciun cub")
+        self.memory = s1
+        lacking = pick.missing(rob.pos)
+        if lacking and not rob.sim:
+            self.log(f"Atenție: prinderea nu e învățată încă (lipsesc {', '.join(lacking)}).")
+        self.notify("Aranjarea e memorată. Luați cuburile (oricâte, oricând), apoi apăsați „Pune cuburile înapoi”.",
+                    ["Memorat!", "Astept butonul"])
+        return s1
 
-        found = {}
-        bases = [b for b in range(round(look[0]) - 75, round(look[0]) + 76, 15) if 0 <= b <= 180]
-        for k, b in enumerate(bases):
-            pose = list(look)
-            pose[0] = b
-            rob.move(pose, 1500 if k == 0 else 600)
-            rob.sleep(aim.SETTLE_S)
-            best = []
-            for _ in range(2):      # două cadre; îl păstrăm pe cel cu mai multe cuburi
-                try:
-                    cubes, _ = vision.find_cubes(self.frame())
-                except RuntimeError:
-                    continue
-                if len(cubes) > len(best):
-                    best = cubes
-            if best:
-                found[b] = sorted(o["color"] for o in best)
-                self.log(f"  baza {b}°: {', '.join(found[b])}")
+    def rebuild(self, rob):
+        """Butonul „Pune cuburile înapoi”: se uită la caroiaj ce lipsește față de memorie, caută cuburile
+        stânga / dreapta și le pune în celulele goale, apoi verifică."""
+        if not self.memory:
+            raise RuntimeError("Nu am memorat încă o aranjare: apasă întâi „Sarcina 1: găsește și memorează”")
+        lacking = pick.missing(rob.pos)
+        if lacking:
+            raise RuntimeError(f"Prinderea nu e învățată: lipsesc {', '.join(lacking)}")
+        t0 = time.time()
+        s1 = self.memory
+        grid, look, memorized = s1["grid"], s1["angles"], s1["colors"]
+        self.log("Mă uit la caroiaj: ce a rămas pe el?")
         rob.move(look, 1500)
-        self.publish("found", found)
-        # Același cub se vede din mai multe unghiuri vecine: pentru fiecare culoare, cele mai multe dintr-o privire.
-        counts = {}
-        for colors in found.values():
-            for c in set(colors):
-                counts[c] = max(counts.get(c, 0), colors.count(c))
-        total = sum(counts.values())
-        want = [c for row in memorized for c in row if c]
-        missing = {c: want.count(c) - counts.get(c, 0) for c in set(want) if want.count(c) > counts.get(c, 0)}
-        self.publish("found_counts", counts)
-        self.notify(f"Am găsit cam {total} cuburi ({', '.join(f'{c} {n}' for c, n in sorted(counts.items())) or 'niciunul'}); "
-                    f"memorate {len(want)}" + (f"; lipsesc: {missing}" if missing else "."),
-                    [f"Gasite: ~{total} cuburi", f"Memorate: {len(want)}"])
-        return {"grid": grid, "angles": look, "colors": memorized, "found": found}
+        rob.sleep(0.5)
+        try:
+            present = self.detect(grid)
+        except RuntimeError:
+            self.log("Nu văd caroiajul acum; îl consider gol.")
+            present = [[None] * 3 for _ in range(3)]
+        left = [f"{grid}{r + 1}{c + 1}" for r in range(3) for c in range(3) if present[r][c]]
+        if left:
+            self.log(f"Au rămas pe caroiaj: {', '.join(left)} (nu le mai pun)")
+        self.notify("Caut cuburile stânga / dreapta și le pun la loc.", ["Pun cuburile", "inapoi..."])
+        picker = pick.Picker(rob, self.see, self.log, look=look, scan_ref=s1["cell"])
+        out = picker.rebuild(memorized, grid, C.S1_ROW_ORDER, present=present)
+        self.publish("rebuild", out)
+        rob.move(look, 1500)
+        rob.sleep(0.5)
+        now = self.detect(grid)
+        self.publish("dest", now)
+        errors = planner.compare(memorized, now)
+        dt = time.time() - t0
+        self.notify(f"Gata în {dt:.0f} s: " + ("caroiajul e identic cu cel memorat." if not errors
+                                                else f"diferă {len(errors)} celule: {errors}"),
+                    ["Sarcina 1 gata", "OK" if not errors else f"{len(errors)} diferente"])
+        return {"grid": grid, "memorized": memorized, "dest": now, "errors": errors,
+                "missing": out["missing"], "seconds": round(dt, 1)}
+
+    def see(self, ref=None):
+        """Cuburile dintr-un cadru nou, fără caroiaj: [{color, x, y, angle}], x și y ca fracțiuni din imagine."""
+        frame = self.frame()
+        h, w = frame.shape[:2]
+        cubes, _ = vision.find_cubes(frame, ref=ref)
+        return [{"color": o["color"], "x": o["center"][0] / w, "y": o["center"][1] / h, "angle": o["angle"]}
+                for o in cubes]
+
+    def learn_pick(self, rob, which):
+        """„Învață prinderea”: cu un cub pus unde a fost învățată PICK_<which>_jos, ține minte unde se vede
+        din poziția de scanare (baza în față) și de deasupra lui (PICK_<which>_sus)."""
+        need = [f"PICK_{which}_sus", f"PICK_{which}_jos"]
+        if any(n not in rob.pos for n in need) or "LOOK_S" not in rob.pos:
+            raise RuntimeError(f"Învață întâi {', '.join(need)} (tools/calibrate_arm.py) și rulează Pasul 1 (LOOK_S)")
+        scan = list(rob.pos["LOOK_S"])
+        scan[0] = rob.pos[f"PICK_{which}_sus"][0]
+        rob.move(scan, 1500)
+        rob.sleep(pick.SETTLE_S)
+        seen = self.see()
+        if len(seen) != 1:
+            raise RuntimeError(f"Din poziția de scanare văd {len(seen)} cuburi; lasă unul singur, în locul prinderii")
+        rob.move(rob.pos[f"PICK_{which}_sus"], 1500)
+        rob.sleep(pick.SETTLE_S)
+        close = self.see(pick.HOVER_REF)
+        if len(close) != 1:
+            raise RuntimeError(f"De deasupra cubului văd {len(close)} cuburi; trebuie unul")
+        data = pick.load()
+        data[which] = {"scan_y": round(seen[0]["y"], 3), "hover": [round(close[0]["x"], 3), round(close[0]["y"], 3)],
+                       "angle": close[0]["angle"]}
+        pick.save(data)
+        self.notify(f"Prinderea {which} învățată: {data[which]}", ["Prindere invatata", which])
+        return data
 
     def look(self, timeout=3.0):
         """Ce vede detecția paginii pe un cadru procesat după acest moment (aceeași urmărire ca în pagină)."""
@@ -500,7 +538,7 @@ class Runner:
         return self.thread is not None and self.thread.is_alive()
 
     def start(self, task):
-        if task not in ("task1", "task2", "aim"):
+        if task not in ("task1", "task2", "aim", "rebuild", "learn_NEAR", "learn_FAR"):
             raise ValueError("Sarcină necunoscută")
         if self.busy():
             raise ValueError("O sarcină rulează deja")
@@ -515,7 +553,10 @@ class Runner:
         try:
             rob = Robot(should_stop=self.stop_ev.is_set, on_look=self.pipeline.set_grid)
             self.log(f"Pornesc {task} (braț {'simulat' if rob.sim else 'REAL'})")
-            fn = {"task1": tasks.run_task1, "task2": tasks.run_task2, "aim": lambda r, ctx: ctx.step1(r)}[task]
+            fn = {"task1": tasks.run_task1, "task2": tasks.run_task2, "aim": lambda r, ctx: ctx.memorize_only(r),
+                  "rebuild": lambda r, ctx: ctx.rebuild(r),
+                  "learn_NEAR": lambda r, ctx: ctx.learn_pick(r, "NEAR"),
+                  "learn_FAR": lambda r, ctx: ctx.learn_pick(r, "FAR")}[task]
             self.result = fn(rob, self)
             self.status = "gata"
         except Stopped:
@@ -600,7 +641,7 @@ class App:
     @staticmethod
     def positions_missing():
         pos = load_positions()
-        return [n for n in REQUIRED if n not in pos]
+        return [n for n in REQUIRED if n not in pos] + pick.missing(pos)
 
     @staticmethod
     def preview_tower(stable):
@@ -719,6 +760,17 @@ class App:
         self.runner.start("aim")
         return self.say("Caut caroiajul cu cuburi în față (orice buton de pe controller oprește)")
 
+    def a_rebuild(self, b):
+        self.runner.start("rebuild")
+        return self.say("Pun cuburile înapoi pe caroiaj (orice buton de pe controller oprește)")
+
+    def a_learn_pick(self, b):
+        which = str(b.get("which", "")).upper()
+        if which not in ("NEAR", "FAR"):
+            raise ValueError("which = NEAR sau FAR")
+        self.runner.start(f"learn_{which}")
+        return self.say(f"Învăț prinderea {which}: un singur cub, pus unde a fost învățată PICK_{which}_jos")
+
     def a_stop(self, b):
         self.runner.stop()
         return self.say("Oprire cerută (se oprește la următoarea mișcare)")
@@ -735,7 +787,7 @@ class App:
         WORLD.reset()
         self.pipeline.reset()
         self.pipeline.set_grid("S")
-        self.memorized = self.verify = None
+        self.memorized = self.verify = self.runner.memory = None
         if not self.sim:
             try:
                 Robot().home()

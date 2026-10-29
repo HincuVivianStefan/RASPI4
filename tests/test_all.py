@@ -247,6 +247,84 @@ class TestTasksSimulated(unittest.TestCase):
             tasks.run_task1(Robot(should_stop=lambda: True), Quiet())
 
 
+class TestPick(unittest.TestCase):
+    """Pasul 3 al Sarcinii 1: cuburile împrăștiate în jurul brațului sunt găsite, prinse și puse la loc.
+    O cameră simplificată: din scanare vede cuburile după unghiul bazei, de deasupra după distanță."""
+    LOOK = [90, 100, 20, 10, 90]
+    POS = {"LOOK_S": LOOK, "PICK_NEAR_sus": [90, 70, 40, 40, 90], "PICK_NEAR_jos": [90, 60, 40, 30, 90],
+           "PICK_FAR_sus": [90, 50, 30, 60, 90], "PICK_FAR_jos": [90, 40, 30, 50, 90]}
+    LEARNED = {"NEAR": {"scan_y": 0.8, "hover": [0.5, 0.7], "angle": 0},
+               "FAR": {"scan_y": 0.55, "hover": [0.5, 0.65], "angle": 0}}
+
+    def see(self, ref=None):
+        a = self.rob.current()
+        out = []
+        for k in self.cubes:
+            if abs(a[1] - self.LOOK[1]) < 0.5 and abs(a[2] - self.LOOK[2]) < 0.5:    # scanare
+                x, y = 0.5 - (k["az"] - a[0]) / 55, 0.8 - (k["r"] - 1.0) * 0.25
+            else:                                                                  # deasupra
+                t = (70 - a[1]) / 20
+                x = 0.5 - (k["az"] - a[0]) * k["r"] * 0.02
+                y = 0.7 - 0.05 * t - (k["r"] - (1 + t)) * 0.6
+            if 0.02 < x < 0.98 and 0.02 < y < 0.98:
+                out.append({"color": k["color"], "x": x, "y": y, "angle": (k["yaw"] - a[0] + a[4] - 90) % 90})
+        return out
+
+    def pick_pose(self, sus, jos, what=None):
+        t = (60 - jos[1]) / 20
+        k = min(self.cubes, key=lambda k: abs(k["az"] - jos[0]) + abs(k["r"] - (1 + t)))
+        self.assertLess(abs(k["az"] - jos[0]), 2, f"baza {jos[0]} față de cubul la {k['az']}")
+        self.assertLess(abs(k["r"] - (1 + t)), 0.06, f"distanța {1 + t} față de {k['r']}")
+        turn = (jos[4] - 90 - (k["yaw"] - jos[0])) % 90
+        self.assertLess(min(turn, 90 - turn), 3, "încheietura nu e aliniată cu cubul")
+        self.assertEqual(what, k["color"])
+        self.cubes.remove(k)
+        self.orig_pick_pose(sus, jos, what)
+
+    def test_rebuild(self):
+        from dofbot import pick
+        layout = [["galben", "verde", None], ["rosu", "galben", "verde"], [None, "rosu", "albastru"]]
+        WORLD.reset([[None] * 3 for _ in range(3)])
+        rng = random.Random(3)
+        azs = [25, 42, 58, 122, 138, 155, 160]
+        self.cubes = [{"color": c, "az": az + rng.uniform(-3, 3), "r": rng.uniform(1.0, 2.0), "yaw": rng.uniform(0, 90)}
+                      for c, az in zip([c for row in layout for c in row if c], azs)]
+        self.rob = Robot()
+        self.rob.pos = dict(self.POS)
+        self.orig_pick_pose, self.rob.pick_pose = self.rob.pick_pose, self.pick_pose
+        ctx = Quiet()
+        out = pick.Picker(self.rob, self.see, ctx.log, look=self.LOOK, learned=self.LEARNED).rebuild(layout)
+        self.assertEqual(out["missing"], [], "\n".join(ctx.logs))
+        self.assertEqual([[s[-1] if s else None for s in row] for row in WORLD.grids["S"]], layout)
+        self.assertEqual(self.cubes, [])
+
+    def test_rebuild_some_left_on_grid(self):
+        """Cuburile luate unul câte unul, nu toate: cele rămase pe caroiaj nu se mută și nu se iau."""
+        from dofbot import pick
+        layout = [["galben", "verde", None], ["rosu", None, "verde"], [None, "rosu", "albastru"]]
+        present = [["galben", None, None], [None, None, None], [None, "rosu", None]]
+        WORLD.reset(present)
+        rng = random.Random(5)
+        loose = [("verde", 30), ("rosu", 50), ("verde", 135), ("albastru", 155)]
+        self.cubes = [{"color": c, "az": az + rng.uniform(-3, 3), "r": rng.uniform(1.0, 2.0), "yaw": rng.uniform(0, 90)}
+                      for c, az in loose]
+        on_grid = [{"color": "galben", "az": 88, "r": 1.4, "yaw": 0}, {"color": "rosu", "az": 92, "r": 1.6, "yaw": 0}]
+        self.cubes += on_grid
+        self.rob = Robot()
+        self.rob.pos = dict(self.POS)
+        self.orig_pick_pose, self.rob.pick_pose = self.rob.pick_pose, self.pick_pose
+        ctx = Quiet()
+        out = pick.Picker(self.rob, self.see, ctx.log, look=self.LOOK, learned=self.LEARNED).rebuild(layout, present=present)
+        self.assertEqual(out["missing"], [], "\n".join(ctx.logs))
+        self.assertEqual(sorted(out["placed"]), ["S12", "S21", "S23", "S33"])
+        self.assertEqual([[s[-1] if s else None for s in row] for row in WORLD.grids["S"]], layout)
+        self.assertEqual(self.cubes, on_grid)
+
+    def test_wrist_delta(self):
+        from dofbot.pick import wrist_delta
+        self.assertEqual([wrist_delta(a, 0) for a in (10, 50, 89, 0)], [10, -40, -1, 0])
+
+
 class TestSettings(unittest.TestCase):
     def tearDown(self):
         C.reset_settings()

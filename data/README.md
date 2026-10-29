@@ -4,6 +4,7 @@
 |---|---|---|
 | `positions.json` | `tools/calibrate_arm.py` | unghiurile servomotoarelor pentru fiecare poziție (HOME, LOOK_S, S11_jos…) |
 | `vision.json` | pagina: colțuri trase / 4 click-uri | colțurile caroiajelor S și D în imagine, folosite când caroiajul nu e găsit automat |
+| `pick.json` | pagina: „Învață prinderea” | unde se vede cubul (la scanare și de deasupra) pentru `PICK_NEAR` / `PICK_FAR` |
 | `settings.json` | pagina: butonul „Salvează” | setările modificate față de `dofbot/config.py`: culori HSV, praguri, ordinea turnului… |
 
 - Lipsa unui fișier nu e o eroare: se folosesc valorile implicite.

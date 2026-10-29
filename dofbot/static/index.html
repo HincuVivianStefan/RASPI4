@@ -252,9 +252,15 @@
       <div class="tbar"><h2>Braț</h2><span class="spacer"></span><span class="badge" id="b-pad"></span></div>
       <div class="wbody">
         <div class="row">
-          <button class="primary" id="aim" onclick="post('aim')" title="privește în față și mișcă umărul / cotul / încheietura până vede caroiajul cu cuburi; salvează unghiurile (LOOK_S / LOOK_D) și memorează cuburile">Pasul 1: găsește caroiajul</button>
+          <button class="primary" id="aim" onclick="post('aim')" title="privește în față și mișcă umărul / cotul / încheietura până vede caroiajul cu cuburi; salvează unghiurile (LOOK_S / LOOK_D) și memorează cuburile">Sarcina 1: găsește și memorează</button>
+          <button class="primary" id="rebuild" onclick="post('rebuild')" title="după ce au fost luate cuburile: se uită ce lipsește de pe caroiaj, caută cuburile stânga / dreapta și le pune în celulele memorate">Pune cuburile înapoi</button>
           <button class="danger" id="estop" onclick="post('stop')">STOP</button>
           <span class="muted">sau orice buton de pe controller</span>
+        </div>
+        <div class="row">
+          <span class="muted">Învață prinderea (un cub unde ai învățat PICK_…_jos):</span>
+          <button id="learn-near" onclick="post('learn_pick', {which: 'NEAR'})">aproape</button>
+          <button id="learn-far" onclick="post('learn_pick', {which: 'FAR'})">departe</button>
         </div>
         <div id="notice"></div>
         <div class="grids">
@@ -534,6 +540,8 @@ function render() {
   const arm = s.arm || {}, pad = arm.pad || {};
   const busy = t.status === "rulează" || t.status === "pauză";
   $("aim").disabled = busy; $("estop").disabled = !busy;
+  $("rebuild").disabled = busy || !s.memorized;
+  $("learn-near").disabled = busy; $("learn-far").disabled = busy;
   $("b-pad").textContent = "controller: " + (pad.status || "–");
   $("b-pad").className = "badge " + (/OPRIT/.test(pad.status) ? "bad" : /automat|manual/.test(pad.status) ? "ok" : "warn");
   $("b-pad").title = (pad.name || "") + (pad.stops ? ` · opriri din controller: ${pad.stops}` : "");

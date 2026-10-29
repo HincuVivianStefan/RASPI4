@@ -17,6 +17,7 @@ CAPTURES_DIR = os.path.join(ROOT, "captures")         # poze salvate (pagină + 
 POS_FILE = os.path.join(DATA_DIR, "positions.json")
 VISION_FILE = os.path.join(DATA_DIR, "vision.json")
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
+PICK_FILE = os.path.join(DATA_DIR, "pick.json")       # „Învață prinderea” din pagină (dofbot/pick.py)
 
 # Simulare (laptop): DOFBOT_SIM=1 forțează brațul simulat, DOFBOT_SIM=0 forțează brațul real.
 # Nesetat: se folosește brațul real dacă Arm_Lib e instalat, altfel simularea.

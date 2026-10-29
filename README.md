@@ -42,16 +42,17 @@ sudo apt install -y python3-opencv python3-numpy python3-smbus i2c-tools
 - Click pe imagine afișează valorile HSV ale punctului. Butonul „Învață” lărgește intervalul unei culori ca să cuprindă punctul ales.
 - **Îngheață** oprește imaginea pe un cadru, ca să reglezi pe aceeași imagine.
 - **Reset** oprește sarcina, șterge memoria și jurnalul.
-- **Braț**: desenul brațului (lateral și de sus) din ultimele unghiuri trimise și butonul **Pasul 1 + 2** (sau Select pe controller):
-  1. se uită drept în față (poziția `SEARCH` dacă e învățată, altfel înălțimea din `LOOK_S` cu baza la 90°) și caută caroiajul **cu cuburi** alternând stânga / dreapta; îl centrează, salvează unghiurile ca `LOOK_S` / `LOOK_D` și memorează cuburile → notificare (în pagină și pe ecranul plăcii de răcire);
-  2. așteaptă să fie luate toate cuburile de pe caroiaj, apoi se uită stânga / dreapta după ele și spune ce culori a găsit și ce lipsește.
+- **Braț**: desenul brațului (lateral și de sus) din ultimele unghiuri trimise și Sarcina 1 în două butoane:
+  1. **Sarcina 1: găsește și memorează** (sau Select pe controller): se uită drept în față (poziția `SEARCH` dacă e învățată, altfel înălțimea din `LOOK_S` cu baza la 90°) și caută caroiajul **cu cuburi**; îl centrează, salvează unghiurile ca `LOOK_S` / `LOOK_D` și memorează cuburile → notificare (în pagină și pe ecranul plăcii de răcire). Apoi stă.
+  2. Cuburile se iau de pe caroiaj (oricâte, unul câte unul), apoi **Pune cuburile înapoi**: se uită la caroiaj ce lipsește față de memorie (cuburile rămase nu le atinge), caută cuburile stânga / dreapta, se așază cu camera exact deasupra fiecăruia, rotește încheietura după el, îl prinde și îl pune în celula memorată (întâi rândul din `S1_ROW_ORDER`); la final verifică caroiajul față de cel memorat. Detalii: [dofbot/pick.py](dofbot/pick.py). Butonul poate fi apăsat de mai multe ori; „Reset” șterge memoria.
+- **Învață prinderea (aproape / departe)**: cu un singur cub pus unde ai învățat `PICK_NEAR_jos` (sau `PICK_FAR_jos`), brațul ține minte unde se vede cubul la scanare și de deasupra lui → `data/pick.json`.
 - **Controllerul USB** e citit de pagină: cât timp nu rulează nimic, muți brațul din el (butoanele din [tools/gamepad.py](tools/gamepad.py)); Select pornește căutarea caroiajului. **În timpul unei sarcini sau căutări, orice buton sau stick o oprește pe loc** și brațul îngheață unde a ajuns. Nu porniți în paralel `tools/gamepad.py`.
 - Pe Pi, coolerul și ecranul plăcii de răcire pornesc odată cu pagina (IP, temperatură, procesor, memorie).
 - **Salvează poze** scrie în `captures/`.
 
 ## Pași până la concurs
 
-1. Pe Pi: `python3 tools/calibrate_arm.py` – înveți pozițiile brațului (vezi [tools/README.md](tools/README.md)).
+1. Pe Pi: `python3 tools/calibrate_arm.py` – înveți pozițiile brațului (vezi [tools/README.md](tools/README.md)), inclusiv cele 4 de prindere `PICK_NEAR_*` / `PICK_FAR_*`; apoi, în pagină, „Învață prinderea” aproape și departe.
 2. Pornești pagina și verifici că ambele caroiaje sunt găsite (S și D).
 3. Reglezi culorile la lumina din sală (click pe cub, apoi „Învață”) și apeși „Salvează”.
 4. Rulezi fiecare sarcină din pagină, întâi cu „Pauză între faze” bifată.

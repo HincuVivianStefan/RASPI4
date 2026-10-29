@@ -120,6 +120,17 @@ class Robot:
             print(f"  [SIM] atenție: nu era niciun cub de luat în {cell}")
         self.goto(f"{cell}_sus", C.T_DESCEND)
 
+    def pick_pose(self, sus, jos, what=None):
+        """Prinde un cub de oriunde (nu dintr-o celulă): sus = deasupra lui, jos = în jurul lui.
+        what = culoarea, pentru lumea simulată."""
+        self.gripper(C.GRIP_OPEN)
+        self.move(sus)
+        self.move(jos, C.T_DESCEND)
+        self.gripper(C.GRIP_CLOSE)
+        if self.sim and what is not None:
+            WORLD.hold(what)
+        self.move(sus, C.T_DESCEND)
+
     def place(self, cell, level=1):
         self.goto(f"{cell}_sus")
         self.move(self.level_pose(cell, level), C.T_DESCEND)

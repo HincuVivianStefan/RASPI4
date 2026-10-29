@@ -41,6 +41,12 @@ class SimWorld:
             self.held = stack.pop()
             return self.held
 
+    def hold(self, color):
+        """Brațul a luat un cub de pe masă, din afara caroiajelor."""
+        with self.lock:
+            if self.held is None:
+                self.held = color
+
     def place(self, cell):
         with self.lock:
             if self.held is None:
