@@ -2,28 +2,34 @@
 
 1. Dacă nu vede caroiajul, rotește baza pe toată cursa (la înălțimea actuală, apoi puțin mai aproape și
    mai departe) până îl găsește.
-2. Mișcă de probă baza, umărul, cotul și încheietura câte câteva grade și vede cum se mută caroiajul în imagine.
+2. Mișcă de probă baza, umărul, cotul și încheietura câte câteva grade și vede cum se mută caroiajul în imagine
+   (o singură dată: efectul lor, Jacobianul, se ține minte în data/aim.json și se corectează după fiecare mișcare).
 3. Corectează în pași mici până când caroiajul e în mijloc, mare, dar cu margine în jur: fețele de sus ale
    cuburilor cad deasupra celulelor în imagine și trebuie să încapă și ele.
+Dacă se vede doar o parte din caroiaj (un colț), restul e extrapolat (vision.find_partial_grid), deci știe încotro.
 
 Fiecare mișcare trece prin Robot, deci Stop din pagină sau orice buton de pe controller o oprește imediat.
 Folosit din pagină (butonul „Caută caroiajul”, sarcinile cu AUTO_AIM) și din tools/center_grid.py.
 """
 import itertools
+import json
+import os
 
 import cv2
 import numpy as np
 
+from . import config as C
 from . import vision
 
 JOINTS = [0, 1, 2, 3]       # baza, umărul, cotul, încheietura (indici 0..4 în unghiuri)
 NAMES = ["baza", "umărul", "cotul", "încheietura", "rotația"]
 PROBE = 3                   # grade pentru mișcarea de probă
 MAX_STEP = 4                # grade, cel mult, la o corecție
+MIN_STEP = 1.0              # grade, cel puțin (servourile au ~1° joc; un pas mai mic nu mută imaginea)
 SIZE_RANGE = (0.40, 0.62)   # cât din imagine să ocupe caroiajul (radical din arie): cu margine, dar mare
 TOLERANCE = 0.05            # cât de aproape de mijloc e destul (din lățimea / înălțimea imaginii)
 DAMPING = 3e-5              # frânează corecțiile pe care articulațiile le pot face doar cu mișcări mari
-SETTLE_S = 0.8              # cât mai așteptăm după o mișcare, să se oprească brațul și camera
+SETTLE_S = 0.3              # cât mai așteptăm după o mișcare (lină, verificată la sosire), să stea camera
 T_MOVE = 600                # durata unei corecții (unitatea Arm_Lib)
 SEARCH_STEP = 10            # grade între opririle bazei când caută caroiajul
 SEARCH_CENTER = 90          # baza „drept în față”
@@ -41,7 +47,8 @@ EDGE_MARGIN = 0.07          # un colț mai aproape de marginea imaginii = nu în
 SIZE_WEIGHT = 1.0           # cât contează mărimea față de centrare
 STEPS = 15                  # pași de corecție, cel mult
 MIN_CUBES = 1               # fără linii vizibile, grupul de cuburi ține loc de caroiaj (apoi se verifică)
-LIMITS = [(0, 180), (0, 180), (0, 180), (0, 180), (0, 270)]
+LIMITS = C.LIMITS
+JACOBIAN_FILE = os.path.join(C.DATA_DIR, "aim.json")   # cum mută fiecare articulație caroiajul în imagine
 
 
 def grid_metrics(frame, prev=None, need_cubes=0):
@@ -54,11 +61,15 @@ def grid_metrics(frame, prev=None, need_cubes=0):
         corners = None      # o grilă fără cuburi: probabil altceva de pe masă / de pe jos
     if corners is not None:
         c = np.float32(corners)
+    elif (part := vision.find_partial_grid(frame)) is not None:
+        # Doar o parte e în imagine: restul e extrapolat, deci centrul și mărimea spun încotro și cât să mergem.
+        return partial_metrics(part, frame.shape[1], frame.shape[0]), None
     else:
         # Caroiaj plin: liniile se văd prea puțin. Dreptunghiul care cuprinde toate cuburile e aproape caroiajul.
         cubes, _ = vision.find_cubes(frame)
         if len(cubes) < MIN_CUBES:
-            return None, None
+            hint = vision.lines_hint(frame)     # măcar bucăți de linie: spre ele
+            return (None, None) if hint is None else (np.array([*hint, sum(SIZE_RANGE) / 2, 1.0]), None)
         x, y, bw, bh = cv2.boundingRect(np.float32(np.vstack([o["box"] for o in cubes])))
         c = np.float32([[x, y], [x + bw, y], [x + bw, y + bh], [x, y + bh]])
     h, w = frame.shape[:2]
@@ -69,6 +80,29 @@ def grid_metrics(frame, prev=None, need_cubes=0):
     rel = c / [w, h]
     out = float((rel < EDGE_MARGIN).any() or (rel > 1 - EDGE_MARGIN).any())
     return np.array([cx / w, cy / h, size, out]), corners
+
+
+def partial_metrics(corners, w, h):
+    """Metricile (ca grid_metrics) unui caroiaj extrapolat: „iese din imagine” = 1."""
+    c = np.float32(corners)
+    cx, cy = c.mean(0)
+    return np.array([cx / w, cy / h, np.sqrt(cv2.contourArea(c) / (w * h)), 1.0])
+
+
+def load_jacobian():
+    try:
+        with open(JACOBIAN_FILE, encoding="utf-8") as f:
+            J = np.array(json.load(f)["J"], float)
+        return J if J.shape == (3, len(JOINTS)) and np.all(np.isfinite(J)) else None
+    except (FileNotFoundError, ValueError, KeyError, TypeError):
+        return None
+
+
+def save_jacobian(J):
+    os.makedirs(C.DATA_DIR, exist_ok=True)
+    with open(JACOBIAN_FILE, "w", encoding="utf-8") as f:
+        json.dump({"J": np.round(J, 6).tolist(), "joints": [NAMES[j] for j in JOINTS],
+                   "rows": ["centru x", "centru y", "mărime"]}, f, indent=2, ensure_ascii=False)
 
 
 class Aimer:
@@ -90,9 +124,13 @@ class Aimer:
         grid = o["corners"] is not None and o["cells"] >= self.need_cubes
         if grid:
             c = np.float32(o["corners"])
+        elif o.get("partial") is not None:
+            return partial_metrics(o["partial"], w, h), False
         elif o["cubes"]:
             x, y, bw, bh = cv2.boundingRect(np.float32(np.vstack([b for b in o["cubes"]])))
             return np.array([(x + bw / 2) / w, (y + bh / 2) / h, sum(SIZE_RANGE) / 2, 0.0]), False
+        elif o.get("lines") is not None:     # doar bucăți de linie: spre ele
+            return np.array([*o["lines"], sum(SIZE_RANGE) / 2, 1.0]), False
         else:
             return None, False
         cx, cy = c.mean(0)
@@ -268,16 +306,18 @@ class Aimer:
             if m is None:
                 continue
             self.log(f"Văd ceva la {[round(a) for a in pose]}: mă așez să-l văd bine")
-            final = self.climb(list(pose)) if self.look else self.center(list(pose), m)
+            final = self.center(list(pose), m)
+            if final is None and self.look:
+                final = self.climb(list(pose))      # rezervă: probe în jur, fără Jacobian
             if final is not None and self.confirmed(GRID_TRIES):
                 return final
             self.log("  Nu e caroiajul cu cuburi; caut mai departe.")
         self.log("Nu am găsit caroiajul cu cuburi.")
         return None
 
-    def center(self, angles, m):
-        """Corectează în pași mici până când caroiajul e în mijloc, la mărimea bună. Întoarce unghiurile."""
-        # Cum mută fiecare articulație caroiajul în imagine (o coloană pe articulație)
+    def probe(self, angles, m):
+        """Jacobianul măsurat: mișcă de probă fiecare articulație și vede cum se mută caroiajul (o coloană pe
+        articulație). Întoarce (J, m măsurat din nou) sau (None, None) dacă a pierdut caroiajul."""
         J = np.zeros((3, len(JOINTS)))
         for k, j in enumerate(JOINTS):
             probe = list(angles)
@@ -292,25 +332,41 @@ class Aimer:
         m = self.measure_stable()
         if m is None:
             self.log("Am pierdut caroiajul după probe.")
-            return None
-        best_err, best_angles = np.inf, list(angles)
+            return None, None
+        return J, m
 
+    def center(self, angles, m):
+        """Corectează în pași mici până când caroiajul e în mijloc, la mărimea bună. Întoarce unghiurile.
+        Jacobianul vine din data/aim.json (fără probe) sau din probe; după fiecare pas e corectat cu ce s-a văzut
+        (actualizare Broyden) și la final e salvat pentru data viitoare."""
+        J = load_jacobian()
+        if J is None:
+            J, m = self.probe(angles, m)
+            if J is None:
+                return None
+        else:
+            self.log("Folosesc efectul articulațiilor ținut minte (data/aim.json): fără mișcări de probă.")
+        best_err, best_angles = np.inf, list(angles)
+        centered = False
         for it in range(STEPS):
             size_err = np.clip(m[2], *SIZE_RANGE) - m[2]     # 0 cât timp mărimea e în plajă
             if m[3] > 0.5:      # nu încape cu margine: întâi îl micșorăm
                 size_err = min(size_err, -0.05)
             err = np.array([0.5 - m[0], 0.5 - m[1], SIZE_WEIGHT * size_err])
             self.log(f"Pas {it + 1}: centru=({m[0]:.2f}, {m[1]:.2f}) mărime={m[2]:.2f}"
-                     + ("  (prea aproape de margine)" if m[3] > 0.5 else ""))
+                     + ("  (iese din imagine)" if m[3] > 0.5 else ""))
             if np.linalg.norm(err) < best_err:
                 best_err, best_angles = np.linalg.norm(err), list(angles)
             if (np.abs(err[:2]) < TOLERANCE).all() and size_err == 0:
                 self.log("Caroiajul e centrat.")
+                centered = True
                 break
             d = self.solve(J, 0.5 * err, angles)
-            if np.abs(d).max() < 0.5:
+            if np.abs(d).max() < 1e-3:
                 self.log("Nu mai pot apropia caroiajul de mijloc (articulații la limită sau mișcările nu-l mută în imagine).")
                 break
+            if np.abs(d).max() < MIN_STEP:      # aproape gata: un pas prea mic nu s-ar vedea în imagine
+                d *= MIN_STEP / np.abs(d).max()
             for k, j in enumerate(JOINTS):
                 angles[j] += d[k]
             self.move(list(angles))
@@ -321,11 +377,16 @@ class Aimer:
                     angles[j] -= d[k]
                 self.move(list(angles))
                 break
+            # Broyden: J corectat cu efectul văzut al acestui pas (fără probe noi).
+            dm = (new - m)[:3]
+            J = J + np.outer(dm - J @ d, d) / max(float(d @ d), 1e-6)
             m = new
         else:
             self.log(f"Nu am ajuns exact în {STEPS} pași; rămân la poziția cea mai bună.")
             angles = best_angles
             self.move(list(angles))
+        if centered:
+            save_jacobian(J)
         final = [round(a) for a in angles]
         self.log(f"Unghiuri finale: {final}")
         return final

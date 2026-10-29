@@ -36,7 +36,9 @@ from .sim_world import WORLD
 
 STATIC = os.path.join(C.HERE, "static")
 SMOOTH = 0.5          # netezirea colțurilor găsite automat (0 = fără)
-LOST_AFTER = 4        # după câte căutări nereușite spunem că e pierdut
+LOST_AFTER = 2        # după câte cadre la rând fără caroiaj spunem că e pierdut (nu mai e desenat)
+LOST_S = 0.6          # sau după atâtea secunde fără confirmare (când procesarea e lentă)
+PARTIAL_EVERY = 3     # caroiaj pierdut, fără sarcină: căutăm unul parțial (un colț) la fiecare al atâtelea cadru
 IDLE_AFTER = 3.0      # fără pagină deschisă și fără sarcină, după atâtea secunde nu mai procesăm nimic
 STREAMS = ("cam", "top", "mask")
 
@@ -111,6 +113,10 @@ class Pipeline:
             self.corners = None
             self.corner_src = None
             self.missed = LOST_AFTER
+            self.last_ok = 0.0
+            self.grid_status, self.grid_conf = "pierdut", None
+            self.partial = None   # caroiajul văzut doar parțial (colțuri extrapolate), când cel întreg lipsește
+            self.lines = None     # fără caroiaj, nici parțial: centrul liniilor negre văzute (x, y în 0..1)
             self.history = deque(maxlen=30)   # 3x3 cu (culoare, fața colorată) sau None
             self.stable_faces = None
             self.result = {"corners": None, "colors": None, "cubes": [], "rejected": []}
@@ -122,7 +128,7 @@ class Pipeline:
             self.saved_ok, self.last_small = True, None
             if grid != self.grid:
                 self.grid = grid
-                self.corners = self.last_good = None
+                self.corners = self.last_good = self.partial = None
                 self.history.clear()
 
     def save_corners(self, grid, corners):
@@ -176,6 +182,8 @@ class Pipeline:
                 if r["corners"]:
                     overlay.draw_grid(view, r["corners"], r["colors"])
                     overlay.draw_corners(view, r["corners"])
+                elif r.get("partial"):
+                    overlay.draw_partial(view, r["partial"])
                 self.publish("cam", cv2.imencode(".jpg", view, q)[1].tobytes())
                 self.stream_fps = fps
             except Exception:   # noqa: BLE001 - fluxul nu are voie să se oprească
@@ -215,7 +223,10 @@ class Pipeline:
         return dx * frame.shape[1] / 160, dy * frame.shape[0] / 120
 
     def track(self, frame):
-        """Colțurile caroiajului: automat (netezite între cadre) sau cele salvate în vision.json."""
+        """Colțurile caroiajului. Automat: cele ținute minte sunt verificate pe fiecare cadru (ieftin) și căutate
+        din nou doar când nu se mai potrivesc; după LOST_AFTER cadre / LOST_S fără confirmare caroiajul e pierdut
+        și nu mai e desenat. vision.json e doar un punct de plecare pentru căutare, nu se afișează neverificat.
+        Manual (AUTO_GRID oprit): colțurile salvate, cât timp camera nu s-a mișcat."""
         self.count += 1
         shift = self.moved(frame)
         moving = shift is not None
@@ -225,38 +236,66 @@ class Pipeline:
             move = lambda c: [[x + shift[0], y + shift[1]] for x, y in c] if c else None  # noqa: E731
             self.corners, self.last_good = move(self.corners), move(self.last_good)
         saved = self.saved.get(self.grid) if self.saved_ok else None
-        if C.AUTO_GRID and self.corner_src == "auto" and self.missed == 0 and self.count % C.GRID_EVERY and not moving:
-            return      # caroiajul e fix pe masă: nu-l căutăm la fiecare cadru
-        # Și colțurile salvate sunt un bun punct de plecare când cuburile acoperă liniile (doar până se mișcă camera).
-        prev = self.corners if self.corner_src else self.last_good or saved
-        found = vision.find_grid(frame, prev) if C.AUTO_GRID else None
-        if (found is not None and prev is None and self.grid == "S" and C.GRID_NEED_CUBES
-                and vision.cubes_inside(frame, found) < C.GRID_NEED_CUBES):
-            found = None    # găsit de la zero, dar fără cuburi: probabil o grilă de pe jos, nu caroiajul
+        if not C.AUTO_GRID:
+            self.corners, self.corner_src = (saved, "manual") if saved else (None, None)
+            self.grid_status, self.grid_conf = ("manual" if saved else "pierdut"), None
+            return
+        now = time.time()
+        if self.corners is not None and not moving:
+            conf = vision.verify_grid(frame, self.corners)
+            # None = liniile sunt aproape toate sub cuburi; cuburile stau însă tot pe el, deci e încă acolo.
+            if conf is None or conf >= vision.VERIFY_OK:
+                self.missed, self.last_ok, self.grid_conf = 0, now, conf
+                self.grid_status = "acoperit" if conf is None else "urmărit"
+                if self.count % C.GRID_EVERY == 0:      # din când în când, ajustăm colțurile pe imagine
+                    self.accept(vision.find_grid(frame, self.corners))
+                return
+        # Pierdut sau camera în mișcare: căutăm pornind de la ce știm (colțurile vechi, apoi cele salvate),
+        # apoi de la zero. Orice rezultat al lui find_grid e verificat pe imagine.
+        prev = self.corners or self.last_good or saved
+        found = vision.find_grid(frame, prev) if prev is not None else None
+        if found is None:
+            found = vision.find_grid(frame)
+            if (found is not None and self.grid == "S" and C.GRID_NEED_CUBES
+                    and vision.cubes_inside(frame, found) < C.GRID_NEED_CUBES):
+                found = None    # găsit de la zero, dar fără cuburi: probabil o grilă de pe jos, nu caroiajul
         if found is not None:
-            self.missed = 0
-            old = self.corners if self.corner_src == "auto" else None
-            if old and all(abs(a - b) < 25 for p, q in zip(found, old) for a, b in zip(p, q)):
-                found = [[SMOOTH * a + (1 - SMOOTH) * b for a, b in zip(p, q)] for p, q in zip(old, found)]
-            self.corners, self.corner_src = found, "auto"
-            self.last_good = found
-        else:
-            self.missed += 1
-            # Cu caroiajul automat pornit, păstrăm puțin ultimele colțuri găsite (o pierdere scurtă nu contează);
-            # când camera se mișcă, ele au fost deja mutate odată cu imaginea.
-            if not C.AUTO_GRID or self.corner_src != "auto" or self.missed >= LOST_AFTER:
-                self.corners, self.corner_src = (saved, "manual") if saved else (None, None)
+            self.accept(found)
+            self.missed, self.last_ok, self.grid_status, self.grid_conf = 0, now, "găsit", None
+            self.partial = self.lines = None
+            return
+        self.missed += 1
+        if self.missed >= LOST_AFTER or now - self.last_ok > LOST_S:
+            self.corners, self.corner_src = None, None
+            self.grid_status, self.grid_conf = "pierdut", None
+            # Poate se vede doar o parte (un colț): îl extrapolăm, ca centrarea să știe încotro să meargă. E mai
+            # scump, deci în afara centrării / sarcinilor doar la fiecare al PARTIAL_EVERY-lea cadru.
+            if self.urgent or self.count % PARTIAL_EVERY == 0:
+                self.partial = vision.find_partial_grid(frame)
+            self.lines = vision.lines_hint(frame) if self.partial is None else None
+            if self.partial is not None:
+                self.grid_status = "parțial"
+
+    def accept(self, found):
+        """Colțuri noi găsite automat, netezite cu cele vechi dacă sunt aproape (fără tremur pe imagine)."""
+        if found is None:
+            return
+        old = self.corners if self.corner_src == "auto" else None
+        if old and all(abs(a - b) < 25 for p, q in zip(found, old) for a, b in zip(p, q)):
+            found = [[SMOOTH * a + (1 - SMOOTH) * b for a, b in zip(p, q)] for p, q in zip(old, found)]
+        self.corners, self.corner_src, self.last_good = found, "auto", found
 
     def process(self, frame):
         t0 = time.time()
         with self.lock:
             self.track(frame)
-            corners, src = self.corners, self.corner_src
+            corners, src, partial = self.corners, self.corner_src, self.partial
         if not (self.urgent or self.count % C.CUBE_EVERY == 0):
             # Doar caroiajul (urmărește camera); cuburile rămân cele de la ultima detecție.
-            self.result = dict(self.result, corners=corners)
-            self.state = dict(self.state, corners=corners, corner_src=src, grid=self.grid,
-                              grid_found=self.missed < LOST_AFTER, frozen=self.frozen is not None,
+            self.result = dict(self.result, corners=corners, partial=partial)
+            self.state = dict(self.state, corners=corners, corner_src=src, grid=self.grid, partial=partial,
+                              grid_found=corners is not None, grid_status=self.grid_status,
+                              grid_conf=self.grid_conf, frozen=self.frozen is not None,
                               stream_fps=round(self.stream_fps, 1))
             self.done_t = time.time()
             return
@@ -269,7 +308,7 @@ class Pipeline:
                 top = vision.annotate_top(d["top"], colors, fracs, cubes, corners)
         else:
             cubes, rejected = vision.find_cubes(frame)   # și fără caroiaj arătăm ce obiecte vedem
-        self.result = {"corners": corners, "colors": colors, "cubes": cubes, "rejected": rejected}
+        self.result = {"corners": corners, "colors": colors, "cubes": cubes, "rejected": rejected, "partial": partial}
         with self.lock:
             if colors:
                 self.history.append(combine(colors, faces))
@@ -286,13 +325,15 @@ class Pipeline:
             "corners": corners,
             "cubes": [{k: o.get(k) for k in ("color", "cell", "face", "angle", "area", "aspect")} for o in cubes],
             "rejected": [{k: o[k] for k in ("color", "reason", "area", "aspect", "fill")} for o in rejected],
-            "corner_src": src, "grid": self.grid, "grid_found": self.missed < LOST_AFTER,
+            "corner_src": src, "grid": self.grid, "grid_found": corners is not None, "partial": partial,
+            "grid_status": self.grid_status, "grid_conf": self.grid_conf,
             "frozen": self.frozen is not None, "stream_fps": round(self.stream_fps, 1),
             "ms": round((time.time() - t0) * 1000), "frame_size": [frame.shape[1], frame.shape[0]],
         }
         self.done_t = time.time()
 
     def mask_image(self, frame):
+        frame = vision.normalize_light(frame)   # ce vede detecția: foaia adusă la alb
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         m = self.view["mask"]
         if m == "grila":
@@ -469,9 +510,11 @@ class Runner:
             time.sleep(0.03)
         with p.lock:
             corners = p.corners if p.corner_src == "auto" and p.missed == 0 else None
+            partial = p.partial if corners is None else None
+            lines = p.lines if corners is None and partial is None else None
         cubes = p.result["cubes"]
         h, w = (p.frame.shape[:2] if p.frame is not None else (C.CAM_H, C.CAM_W))
-        return {"corners": corners, "cubes": [o["box"] for o in cubes],
+        return {"corners": corners, "partial": partial, "lines": lines, "cubes": [o["box"] for o in cubes],
                 "cells": sum(1 for o in cubes if o.get("cell")), "size": (w, h)}
 
     def aim(self, rob, search=True, center=True):
@@ -636,7 +679,12 @@ class App:
         return {"ok": True}
 
     def a_settings(self, b):
-        C.apply_settings(b.get("values", {}))
+        values = b.get("values", {})
+        C.apply_settings(values)
+        if any(k.startswith("CAM_") for k in values):
+            failed = self.cam.controls()
+            if failed:
+                return self.say(f"Setări aplicate, dar camera nu acceptă: {', '.join(failed)}")
         if b.get("save"):
             C.save_settings()
             return self.say("Setări aplicate și salvate în settings.json")
@@ -661,6 +709,15 @@ class App:
         C.apply_settings({"AUTO_GRID": False})
         return self.say(f"Colțuri {grid} salvate în vision.json; caroiaj automat oprit")
 
+    def a_expose(self, b):
+        """Expunere manuală reglată pe foaia albă (vezi vision.auto_expose), apoi lăsată fixă."""
+        if self.cam.cap is None:
+            raise ValueError("Merge doar cu o cameră adevărată")
+        exp = vision.auto_expose(self.cam.cap, lambda: self.cam.fresh()[0], self.runner.log)
+        if exp is None:
+            raise ValueError("Nu am putut regla expunerea (vezi jurnalul)")
+        return self.say(f"Expunere fixă: {exp} (apasă Salvează ca să rămână)")
+
     def a_freeze(self, b):
         p = self.pipeline
         p.frozen = None if p.frozen is not None or p.frame is None else p.frame.copy()
@@ -671,7 +728,8 @@ class App:
         frame = self.pipeline.frame
         if frame is None:
             raise ValueError("Niciun cadru încă")
-        hsv = mean_hsv(frame, b["x"], b["y"])
+        # Pe imaginea normalizată (LIGHT_NORM), ca valorile învățate să fie cele pe care le folosește detecția.
+        hsv = mean_hsv(vision.normalize_light(frame), b["x"], b["y"])
         px = np.uint8([[hsv]])
         match = [n for n in C.COLORS if vision.color_mask(px, n)[0, 0]]
         return {"ok": True, "x": int(b["x"]), "y": int(b["y"]), "hsv": hsv, "match": match}
@@ -745,7 +803,7 @@ class App:
 
     def a_camera(self, b):
         src = str(b.get("source", ""))
-        if not (src == "synth" or (src.startswith("camera:") and src[7:].isdigit())):
+        if not (src in ("synth", "synth-arm") or (src.startswith("camera:") and src[7:].isdigit())):
             raise ValueError("Sursă invalidă")
         self.cam.switch(src)
         self.pipeline.reset()
@@ -769,6 +827,29 @@ class App:
                 with open(f"{name}_{k}.jpg", "wb") as f:
                     f.write(self.pipeline.jpeg[k])
         return self.say(f"Salvat {os.path.relpath(name, C.ROOT)}*.jpg")
+
+    def a_record(self, b):
+        """Înregistrează N cadre brute (PNG, fără pierderi) pentru reglajul detecției fără braț: în
+        captures/set_<dată>/, cu meta.json (setări, colțuri) și labels.json = aranjarea detectată acum.
+        Verifici labels.json de mână, pui "verificat": true, apoi tests/test_captures.py le folosește."""
+        n = max(1, min(60, int(b.get("n", 10))))
+        folder = os.path.join(C.CAPTURES_DIR, time.strftime("set_%Y%m%d_%H%M%S"))
+        os.makedirs(folder)
+        seq = None
+        for i in range(n):
+            frame, seq = self.cam.fresh(after=seq)
+            vision.imwrite(os.path.join(folder, f"{i:02d}.png"), frame)
+            time.sleep(0.25)
+        st = self.pipeline.state
+        with open(os.path.join(folder, "meta.json"), "w", encoding="utf-8") as f:
+            json.dump({"grid": self.pipeline.grid, "corners": st.get("corners"), "source": self.cam.source,
+                       "settings": C.settings(), "light_gains": (lambda g: None if g is None else g.tolist())(
+                           vision.light_gains(frame))}, f, indent=2, ensure_ascii=False)
+        with open(os.path.join(folder, "labels.json"), "w", encoding="utf-8") as f:
+            json.dump({"verificat": False, "colors": st.get("stable") or st.get("colors")}, f, indent=2,
+                      ensure_ascii=False)
+        return self.say(f"{n} cadre în {os.path.relpath(folder, C.ROOT)}: verifică labels.json și pune "
+                        f"\"verificat\": true")
 
 
 APP = None

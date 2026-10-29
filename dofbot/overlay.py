@@ -66,6 +66,23 @@ def draw_grid(view, corners, result, scale=1.0):
                         0.4, (255, 255, 255), 1, cv2.LINE_AA)
 
 
+def draw_partial(view, corners):
+    """Caroiajul văzut doar parțial (extrapolat și în afara imaginii): linii punctate portocalii și o săgeată
+    din mijlocul imaginii spre centrul lui, adică încotro trebuie să se uite camera."""
+    inv = cv2.getPerspectiveTransform(np.float32([[0, 0], [3, 0], [3, 3], [0, 3]]), np.float32(corners))
+    orange = (0, 140, 255)
+    t = np.linspace(0, 3, 61)
+    for i in range(4):
+        for line in (np.column_stack([np.full_like(t, i), t]), np.column_stack([t, np.full_like(t, i)])):
+            pts = np.clip(cv2.perspectiveTransform(np.float32(line)[None], inv)[0], -30000, 30000)
+            for p, q in zip(pts[0::2], pts[1::2]):      # punctat: o bucată da, una nu
+                cv2.line(view, tuple(map(int, p)), tuple(map(int, q)), orange, 2, cv2.LINE_AA)
+    h, w = view.shape[:2]
+    c = np.clip(cv2.perspectiveTransform(np.float32([[[1.5, 1.5]]]), inv)[0, 0], [10, 10], [w - 10, h - 10])
+    cv2.arrowedLine(view, (w // 2, h // 2), tuple(map(int, c)), orange, 3, cv2.LINE_AA, tipLength=0.08)
+    cv2.putText(view, "caroiaj partial", (10, h - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.6, orange, 2, cv2.LINE_AA)
+
+
 def draw_corners(view, corners, scale=1.0):
     pts = [(int(x * scale), int(y * scale)) for x, y in corners]
     for i, p in enumerate(pts):

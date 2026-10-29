@@ -1,6 +1,7 @@
 """Camera citită continuu într-un fir separat, ca pagina web și sarcinile să o folosească în același timp.
 
-Surse: "camera:0" (sau alt index), "synth" (scena desenată + lumea simulată), "image:poza.jpg".
+Surse: "camera:0" (sau alt index), "synth" (scena desenată + lumea simulată), "image:poza.jpg",
+"synth-arm" (ce vede camera de pe brațul simulat, din ultimele unghiuri trimise: căutare / centrare fără braț).
 Dacă sursa nu merge, se trimit cadre cu mesajul de eroare și se reîncearcă singur.
 """
 import threading
@@ -39,6 +40,7 @@ class Camera:
         self.frame = None
         self.seq = 0
         self.error = None
+        self.cap = None       # cv2.VideoCapture deschis (doar pentru o cameră adevărată)
         self._stop = threading.Event()
         self._thread = None
 
@@ -65,6 +67,10 @@ class Camera:
             from . import synth
             from .sim_world import WORLD
             return lambda: synth.render(WORLD.snapshot(), seed=self.seq), None
+        if source == "synth-arm":
+            from . import sim_world
+            from .arm_driver import LAST
+            return lambda: sim_world.arm_view(LAST["angles"] or C.SIM_START, seed=self.seq), None
         if source.startswith("image:"):
             from . import vision
             img = vision.imread(source[6:])
@@ -93,6 +99,7 @@ class Camera:
                 continue
             self.error, fails = None, 0
             live = cap is not None
+            self.cap = cap
             while not stop.is_set():
                 t0 = time.time()
                 f = read()
@@ -108,9 +115,18 @@ class Camera:
                 self._publish(f)
                 if not live:    # poză / scenă simulată: ritmul fluxului
                     stop.wait(max(0.0, 1 / C.STREAM_FPS - (time.time() - t0)))
+            self.cap = None
             if cap is not None:
                 cap.release()
             stop.wait(RETRY_S if self.error else 0)
+
+    def controls(self):
+        """Reaplică setările CAM_* pe camera deschisă. Întoarce ce nu a mers, sau None dacă nu e o cameră."""
+        cap = self.cap
+        if cap is None:
+            return None
+        from . import vision
+        return vision.camera_controls(cap)
 
     def latest(self):
         with self.cond:

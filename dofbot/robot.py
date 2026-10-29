@@ -1,4 +1,5 @@
 import json
+import math
 import time
 
 from . import config as C
@@ -16,6 +17,32 @@ class Stopped(Exception):
     """Sarcina a fost oprită (butonul Stop / Reset)."""
 
 
+LIMIT_SLACK = 5   # grade: o poziție cerută cu atât peste limite e o greșeală (calibrare / calcul), nu o rotunjire
+
+
+def limit(angles):
+    """Unghiurile servo1..5 aduse în LIMITS. Ridică ValueError dacă unul e mult în afară."""
+    out = []
+    for i, (a, (lo, hi)) in enumerate(zip(angles, C.LIMITS)):
+        a = float(a)
+        if not lo - LIMIT_SLACK <= a <= hi + LIMIT_SLACK:
+            raise ValueError(f"servo {i + 1}: {a:.1f}° e în afara limitelor {lo}–{hi}")
+        out.append(min(hi, max(lo, a)))
+    return out
+
+
+def min_jerk(s):
+    """Cât din drum (0..1) la momentul s (0..1): pornește și se oprește cu viteză și accelerație zero."""
+    return s * s * s * (10 - 15 * s + 6 * s * s)
+
+
+def duration(dist, t):
+    """Secunde pentru o mișcare de `dist` grade (cea mai lungă articulație): cel puțin t (unitatea Arm_Lib), dar
+    nu mai repede decât V_MAX și A_MAX (la minimum-jerk, viteza maximă = 1,875 × dist / T, accelerația ≈ 5,77 ×
+    dist / T²)."""
+    return max(t * C.TIME_UNIT_S, 1.875 * dist / C.V_MAX, math.sqrt(5.77 * dist / C.A_MAX))
+
+
 def load_positions():
     try:
         with open(C.POS_FILE, encoding="utf-8") as f:
@@ -30,6 +57,7 @@ class Robot:
         time.sleep(0.1)
         self.pos = load_positions()
         self.grip = C.GRIP_OPEN
+        self.last = None    # ultimele unghiuri trimise (servo1..5): de aici pornește următoarea mișcare
         self.should_stop = should_stop or (lambda: False)
         self.on_look = on_look or (lambda grid: None)
 
@@ -63,8 +91,9 @@ class Robot:
 
     def freeze(self):
         """Oprește brațul unde a ajuns: citește unghiurile din mers și i le trimite înapoi."""
-        a = [int(round(x)) for x in self.current()]
-        self.arm.Arm_serial_servo_write6(a[0], a[1], a[2], a[3], a[4], self.grip, 300)
+        a = self.current()
+        self._send(a, 300)
+        self.last = a
 
     def _get(self, name):
         if name in self.pos:
@@ -77,11 +106,45 @@ class Robot:
         raise KeyError(f"Poziția '{name}' nu e calibrată (rulează calibrate_arm.py)")
 
     def move(self, angles, t=C.T_TRAVEL):
-        """angles = [s1..s5]; gripperul rămâne cum e."""
+        """angles = [s1..s5]; gripperul rămâne cum e. Lin: puncte intermediare trimise la MOTION_HZ, cu profil
+        minimum-jerk (fără smucitură la pornire și oprire), toate articulațiile ajung odată. Durata = t (unitatea
+        Arm_Lib), dar nu mai repede decât permit V_MAX / A_MAX. Stop îl oprește la următorul punct (≤ 25 ms)."""
         self.check()
-        a = [int(round(x)) for x in angles]
-        self.arm.Arm_serial_servo_write6(a[0], a[1], a[2], a[3], a[4], self.grip, t)
-        self._wait(t)
+        target = limit(angles)
+        start = self.last or self.current()
+        dist = max(abs(b - a) for a, b in zip(start, target))
+        n = max(1, math.ceil(duration(dist, t) * C.MOTION_HZ))
+        step_ms = int(2000 / C.MOTION_HZ)      # fiecare punct: atins în două perioade, ca mișcarea să nu stea
+        t0 = time.time()
+        for k in range(1, n + 1):
+            self.check()
+            s = min_jerk(k / n)
+            self._send([a + (b - a) * s for a, b in zip(start, target)], step_ms)
+            if not self.sim or C.SIM_TIME_SCALE:
+                wait = t0 + k / C.MOTION_HZ * (C.SIM_TIME_SCALE if self.sim else 1) - time.time()
+                if wait > 0:
+                    time.sleep(wait)
+        self.last = target
+        if self.sim and C.SIM_VERBOSE:
+            print(f"  [SIM] servo1-5 -> {[round(a, 1) for a in target]}  ({n} puncte)")
+        self.settle(target)
+
+    def _send(self, angles, ms):
+        a = [round(float(x), 1) for x in angles]   # Arm_Lib primește și zecimale (~0,08° pe pas)
+        self.arm.Arm_serial_servo_write6(a[0], a[1], a[2], a[3], a[4], self.grip, ms)
+
+    def settle(self, target):
+        """Așteaptă să ajungă brațul (servourile citite la SETTLE_TOL de țintă, cel mult SETTLE_MAX_S), apoi SETTLE_S.
+        Pe brațul simulat, doar SETTLE_S."""
+        if not self.sim:
+            end = time.time() + C.SETTLE_MAX_S
+            while time.time() < end:
+                self.check()
+                got = [self.arm.Arm_serial_servo_read(i + 1) for i in range(5)]
+                if all(g is None or abs(g - a) <= C.SETTLE_TOL for g, a in zip(got, target)):
+                    break
+                time.sleep(0.02)
+        self.sleep(C.SETTLE_S)
 
     def goto(self, name, t=C.T_TRAVEL):
         if self.sim and C.SIM_VERBOSE:

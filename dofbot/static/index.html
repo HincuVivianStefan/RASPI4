@@ -129,6 +129,7 @@
     <option value="camera:0">Camera 0</option><option value="camera:1">Camera 1</option>
     <option value="camera:2">Camera 2</option><option value="camera:3">Camera 3</option>
     <option value="synth">Scenă simulată</option>
+    <option value="synth-arm" title="camera de pe brațul simulat: mută brațul (controller, Pasul 1 + 2) și vezi ce vede">Braț simulat (cameră pe gripper)</option>
   </select>
   <span class="badge" id="b-src"></span>
   <span class="badge" id="b-arm"></span>
@@ -137,6 +138,7 @@
   <span class="badge" id="b-ms"></span>
   <span class="spacer"></span>
   <button onclick="post('snapshot')">Salvează poze</button>
+  <button onclick="post('record', {n: 10})" title="10 cadre brute + aranjarea detectată, pentru tests/test_captures.py">Înregistrează 10 cadre</button>
   <a href="/frame.jpg" download="cadru.jpg"><button>Descarcă cadrul</button></a>
   <button class="danger" onclick="if (confirm('Reset: oprește sarcina, șterge memoria și jurnalul?')) post('reset')">Reset</button>
 </header>
@@ -276,6 +278,13 @@
           <button onclick="post('settings/defaults').then(loadSettings)">Valori implicite</button>
         </div>
         <div class="muted">Schimbările se văd imediat pe imagine; fără „Salvează” se pierd la repornire.</div>
+        <h3>Camera (expunere, balans de alb)</h3>
+        <div class="row">
+          <button onclick="post('expose').then(loadSettings)">Auto-expune pe hârtie</button>
+          <button onclick="setVal({CAM_EXPOSURE: 0, CAM_GAIN: -1, CAM_WB: 0}).then(loadSettings)">Înapoi pe automat</button>
+        </div>
+        <div class="muted">Cu caroiajul în cadru: reglează expunerea până când foaia e albă, apoi o lasă fixă, ca
+          brațul să nu schimbe culorile când mută camera. 0 / −1 de mai sus = automat.</div>
         <h3>Colțurile caroiajului (rezervă când nu e găsit automat)</h3>
         <div class="row">
           <button onclick="startCorners()">Colțuri manuale (4 click-uri)</button>
@@ -304,7 +313,9 @@ const NUM = [   // cheie, etichetă, min, max, pas
   ["STABLE_FRAMES", "cadre pentru vot", 1, 30, 1], ["GRID_C", "contrast linii caroiaj", 1, 60, 1],
   ["GRID_MAX_S", "saturație max. linii", 0, 255, 1], ["GRID_MIN_AREA", "arie min. caroiaj", 0.005, 0.5, 0.005],
   ["GRID_MIN_SCORE", "scor min. caroiaj", 0, 1, 0.01], ["GRID_MIN_LINE", "linie interioară minimă", 0, 1, 0.01],
-  ["GRID_MAX_RATIO", "proporție max. caroiaj", 1, 4, 0.1],
+  ["GRID_MAX_RATIO", "proporție max. caroiaj", 1, 4, 0.1], ["LIGHT_MAX_GAIN", "lumină: amplificare max.", 1, 8, 0.1],
+  ["CAM_EXPOSURE", "cameră: expunere (0 = auto)", 0, 2000, 1], ["CAM_GAIN", "cameră: amplificare (−1 = auto)", -1, 255, 1],
+  ["CAM_WB", "cameră: balans de alb K (0 = auto)", 0, 8000, 100],
 ];
 let applyT = 0, dragCorners = null, dragIdx = -1, dragMoved = false;
 const $ = id => document.getElementById(id);
@@ -353,7 +364,8 @@ function loadSettings() {
     const st = s.settings;
     $("numfields").innerHTML = NUM.map(([k, lbl, lo, hi, step]) =>
       `<label class="f" title="${k}">${lbl} <span class="slider"><input type="range" id="n-${k}" min="${lo}" max="${hi}" step="${step}" value="${st[k]}"><output id="o-${k}">${st[k]}</output></span></label>`
-    ).join("") + `<label class="f">caroiaj automat <span><input type="checkbox" id="n-AUTO_GRID" ${st.AUTO_GRID ? "checked" : ""}></span></label>`
+    ).join("") + `<label class="f" title="LIGHT_NORM">foaia adusă la alb <span><input type="checkbox" id="n-LIGHT_NORM" ${st.LIGHT_NORM ? "checked" : ""}> <span class="muted">culori corecte și în lumină slabă / colorată</span></span></label>`
+      + `<label class="f">caroiaj automat <span><input type="checkbox" id="n-AUTO_GRID" ${st.AUTO_GRID ? "checked" : ""}></span></label>`
       + `<label class="f" title="CUBE_MODE">cuburi ca obiecte <span><input type="checkbox" id="n-CUBE_MODE" ${st.CUBE_MODE ? "checked" : ""}> <span class="muted">debifat = metoda veche, procent de pixeli</span></span></label>`;
     let h = "<table class='colors'><tr><th></th><th colspan=3>min H S V</th><th colspan=3>max H S V</th><th></th></tr>";
     for (const [name, ranges] of Object.entries(st.COLORS)) ranges.forEach((rg, i) => {
@@ -456,8 +468,11 @@ function render() {
   $("b-src").textContent = s.camera_error ? "imagine: " + s.camera_error : "imagine OK";
   $("b-src").className = "badge " + (s.camera_error ? "bad" : "ok");
   $("b-arm").textContent = "braț: " + (s.sim ? "simulat" : "REAL"); $("b-arm").className = "badge " + (s.sim ? "warn" : "ok");
-  $("b-grid").textContent = v.corners ? `caroiaj ${v.grid}: ${v.corner_src === "auto" ? "găsit automat" : "colțuri salvate"}` : `caroiaj ${v.grid}: NEGĂSIT`;
-  $("b-grid").className = "badge " + (v.corners ? "ok" : "bad");
+  // găsit / urmărit (verificat pe cadrul ăsta, cu încrederea) / acoperit (liniile sub cuburi) / parțial / manual / pierdut
+  const gs = v.corners ? (v.grid_status || (v.corner_src === "auto" ? "găsit" : "manual")) : "pierdut";
+  const conf = v.grid_conf != null ? ` ${Math.round(v.grid_conf * 100)}%` : "";
+  $("b-grid").textContent = `caroiaj ${v.grid}: ${gs === "pierdut" ? "NEGĂSIT" : gs + conf}`;
+  $("b-grid").className = "badge " + ({"pierdut": "bad", "parțial": "warn", "manual": "warn"}[gs] || "ok");
   $("b-task").textContent = "sarcină: " + t.status + (t.name ? ` (${t.name})` : "");
   $("b-task").className = "badge " + ({"rulează": "ok", "pauză": "warn", "eroare": "bad"}[t.status] || "");
   $("b-ms").textContent = `flux ${v.stream_fps ?? "–"} cadre/s · detecție ${v.ms ?? "–"} ms`;
@@ -561,8 +576,8 @@ function render() {
   $("mask").value = s.view.mask; $("rejected").checked = s.view.rejected;
   $("cornerinfo").textContent = "Colțuri salvate pentru: " + (s.saved_corners.join(", ") || "niciun caroiaj") +
     ` · caroiajul curent: ${v.grid}`;
-  $("synthbox").style.display = s.source === "synth" ? "" : "none";
-  if (s.source === "synth" && synthLayout) {
+  $("synthbox").style.display = s.source.startsWith("synth") ? "" : "none";
+  if (s.source.startsWith("synth") && synthLayout) {
     const cycle = [null].concat(Object.keys(s.colors_hex));
     drawGrid($("synth"), synthLayout, {click: (r, c) => {
       synthLayout[r][c] = cycle[(cycle.indexOf(synthLayout[r][c]) + 1) % cycle.length]; render(); }});

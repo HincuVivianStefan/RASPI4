@@ -35,11 +35,14 @@ sudo apt install -y python3-opencv python3-numpy python3-smbus i2c-tools
 
 - **Fluxul camerei** (15 cadre/s), cu desenul ultimei detecții peste el:
   - caroiajul găsit și colțurile lui (roșii, le poți trage cu mouse-ul);
+  - caroiajul văzut doar parțial (un colț în imagine): punctat portocaliu, cu o săgeată spre centrul lui;
   - cuburile găsite, cu chenar colorat.
+- Eticheta caroiajului arată starea lui: **găsit**, **urmărit** (cu încrederea), **acoperit** (liniile sub cuburi), **parțial**, **NEGĂSIT**. Un caroiaj care dispare din imagine nu mai rămâne desenat.
 - **Detecție**: caroiajul 3×3 pe cadrul curent și varianta **stabilă** (votul pe ultimele cadre). Sarcinile folosesc varianta stabilă.
 - **Sarcina 1 / Sarcina 2**: setările fiecăreia, butoanele Rulează / Stop / Continuă și jurnalul.
 - **Setări**: glisoare care se văd imediat pe imagine. „Salvează” le scrie în `data/settings.json`.
 - Click pe imagine afișează valorile HSV ale punctului. Butonul „Învață” lărgește intervalul unei culori ca să cuprindă punctul ales.
+- **Lumina**: bifa „foaia adusă la alb” (implicit pornită) face culorile, și verdele închis, recunoscute în lumină slabă sau colorată. „Auto-expune pe hârtie” fixează expunerea camerei, ca brațul să nu schimbe culorile când mută camera.
 - **Îngheață** oprește imaginea pe un cadru, ca să reglezi pe aceeași imagine.
 - **Reset** oprește sarcina, șterge memoria și jurnalul.
 - **Braț**: desenul brațului (lateral și de sus) din ultimele unghiuri trimise și butonul **Pasul 1 + 2** (sau Select pe controller):
@@ -47,7 +50,9 @@ sudo apt install -y python3-opencv python3-numpy python3-smbus i2c-tools
   2. așteaptă să fie luate toate cuburile de pe caroiaj, apoi se uită stânga / dreapta după ele și spune ce culori a găsit și ce lipsește.
 - **Controllerul USB** e citit de pagină: cât timp nu rulează nimic, muți brațul din el (butoanele din [tools/gamepad.py](tools/gamepad.py)); Select pornește căutarea caroiajului. **În timpul unei sarcini sau căutări, orice buton sau stick o oprește pe loc** și brațul îngheață unde a ajuns. Nu porniți în paralel `tools/gamepad.py`.
 - Pe Pi, coolerul și ecranul plăcii de răcire pornesc odată cu pagina (IP, temperatură, procesor, memorie).
-- **Salvează poze** scrie în `captures/`.
+- **Salvează poze** scrie în `captures/`. **Înregistrează 10 cadre** salvează poze brute pentru reglajul detecției fără braț (vezi [tests/README.md](tests/README.md)).
+- Sursa **Braț simulat (cameră pe gripper)**: ce ar vedea camera de pe braț, din unghiurile brațului simulat. Mută brațul din controller sau pornește „Pasul 1 + 2” și vezi cum își caută și centrează caroiajul, fără braț.
+- Brațul se mișcă lin: pornește și oprește fără smucituri, iar Stop îl oprește pe loc (în ≤ 25 ms).
 
 ## Pași până la concurs
 

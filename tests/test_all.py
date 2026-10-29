@@ -12,7 +12,7 @@ import cv2  # noqa: E402
 import numpy as np  # noqa: E402
 
 from dofbot import config as C  # noqa: E402
-from dofbot import planner, synth, tasks, vision  # noqa: E402
+from dofbot import planner, sim_world, synth, tasks, vision  # noqa: E402
 from dofbot.robot import Robot, Stopped  # noqa: E402
 from dofbot.sim_world import WORLD  # noqa: E402
 
@@ -174,6 +174,20 @@ class TestVision(unittest.TestCase):
             good += found == [[v[0] if v else None for v in row] for row in layout]
         self.assertGreaterEqual(good, 18)
 
+    def test_low_and_colored_light(self):
+        """Sală întunecată, bec cald / rece: foaia e adusă la alb, deci caroiajul și culorile (și verdele
+        închis) rămân recunoscute."""
+        rng = random.Random(4)
+        for light, cast in ((0.35, (1, 1, 1)), (0.2, (1, 1, 1)), (0.35, (1.0, 0.85, 0.6)), (0.35, (0.8, 0.9, 1.0))):
+            prev = vision.find_grid(synth.render([[None] * 3 for _ in range(3)], light=light, cast=cast))
+            self.assertIsNotNone(prev, f"caroiaj gol negăsit la lumina {light} {cast}")
+            for seed in range(5):
+                layout = random_layout(rng)
+                frame = synth.render(layout, seed=seed, light=light, cast=cast)
+                corners = vision.find_grid(frame, prev)
+                self.assertIsNotNone(corners, f"lumina {light} {cast}, seed {seed}")
+                self.assertEqual(vision.detect_cells(frame, corners)[0], layout, f"lumina {light} {cast}, seed {seed}")
+
     def test_empty_grid(self):
         frame = synth.render([[None] * 3 for _ in range(3)])
         corners = vision.find_grid(frame)
@@ -218,6 +232,204 @@ class TestVision(unittest.TestCase):
         a = [["rosu"] * 3] * 3
         b = [[None] * 3] * 3
         self.assertEqual(vision.vote([a, b, a]), a)
+
+
+class FakeCap:
+    """Cameră falsă: poza e cu atât mai luminoasă cu cât expunerea e mai mare (300 = lumină normală)."""
+
+    def __init__(self, exposure):
+        self.props = {cv2.CAP_PROP_EXPOSURE: exposure}
+
+    def set(self, prop, value):
+        self.props[prop] = value
+        return True
+
+    def get(self, prop):
+        return self.props.get(prop, 0)
+
+    def frame(self):
+        return synth.render([["verde", None, None], [None] * 3, [None] * 3],
+                            light=self.props[cv2.CAP_PROP_EXPOSURE] / 300)
+
+
+class TestCamera(unittest.TestCase):
+    def tearDown(self):
+        C.reset_settings()
+        C.STABLE_FRAMES = 3
+
+    def test_auto_expose_brings_paper_to_white(self):
+        """Din întuneric și din imagine arsă: expunerea ajunge să facă foaia ~EXPOSE_TARGET, apoi rămâne fixă."""
+        for start in (30, 2000):
+            cap = FakeCap(start)
+            exp = vision.auto_expose(cap, cap.frame, log=lambda m: None)
+            self.assertEqual(exp, C.CAM_EXPOSURE)
+            self.assertEqual(cap.props[cv2.CAP_PROP_AUTO_EXPOSURE], 1)    # manual
+            v = vision.paper_color(cap.frame()).max()
+            self.assertLess(abs(v - vision.EXPOSE_TARGET), 0.1 * vision.EXPOSE_TARGET, f"de la {start}")
+
+
+class TestTracking(unittest.TestCase):
+    """Urmărirea caroiajului din pagină (web.Pipeline.track), cadru cu cadru."""
+
+    def setUp(self):
+        from dofbot import web
+        vision.forget()
+        self.p = web.Pipeline(cam=None)
+        self.p.set_grid("S")
+
+    def feed(self, frame, n=1):
+        for _ in range(n):
+            self.p.track(frame)
+            self.p.last_small = None    # cadre sintetice identice: fără „cameră în mișcare”
+        return self.p.corners
+
+    def test_grid_removed_is_not_drawn(self):
+        """Caroiajul luat de pe masă (cu sau fără cuburi) dispare în cel mult LOST_AFTER cadre."""
+        from dofbot import web
+        half = [["rosu", None, "verde"], [None, "galben", None], ["albastru", None, None]]
+        for gone in (synth.render(half, lines=False), synth.render(half, paper=False),
+                     synth.render([[None] * 3 for _ in range(3)], paper=False)):
+            self.setUp()
+            self.assertIsNotNone(self.feed(synth.render(half, seed=2), 2))
+            self.assertIsNone(self.feed(gone, web.LOST_AFTER))
+            self.assertEqual(self.p.grid_status, "pierdut")
+
+    def test_wrong_saved_corners_are_not_shown(self):
+        """Colțuri salvate pe alt calculator (vision.json greșit): nu se desenează un caroiaj inexistent."""
+        bad = [[x + 120, y - 60] for x, y in synth.grid_corners()]
+        self.p.saved = {"S": bad}
+        self.assertIsNone(self.feed(synth.render([[None] * 3 for _ in range(3)], paper=False), 3))
+        found = self.feed(synth.render([["rosu", None, None], [None] * 3, [None] * 3]))
+        for p, q in zip(found, synth.grid_corners()):     # cu caroiajul în cadru, e găsit la locul lui
+            self.assertLess(max(abs(p[0] - q[0]), abs(p[1] - q[1])), 15)
+
+    def test_full_grid_stays_tracked(self):
+        """Caroiajul plin (liniile aproape toate sub cuburi) rămâne urmărit."""
+        self.feed(synth.render([[None] * 3 for _ in range(3)]))
+        self.assertIsNotNone(self.feed(synth.render(C.SYNTH_LAYOUT, seed=3), 6))
+        self.assertIn(self.p.grid_status, ("urmărit", "acoperit", "găsit"))
+
+
+class TestArmCamera(unittest.TestCase):
+    """Camera de pe brațul simulat (sim_world.arm_view): caroiajul plin, cel văzut doar parțial și centrarea."""
+    HALF = [["rosu", None, "verde"], [None, "galben", None], ["albastru", None, "rosu"]]
+
+    def setUp(self):
+        vision.forget()
+
+    def tearDown(self):
+        WORLD.reset()
+
+    @staticmethod
+    def err(a, b):
+        return float(np.abs(np.float32(a) - np.float32(b)).max())
+
+    def test_full_grid_found_from_cubes(self):
+        """9 cuburi, liniile aproape toate ascunse: caroiajul e găsit de la zero, din rețeaua fețelor de sus."""
+        rng, good = random.Random(11), 0
+        for k in range(6):
+            layout = [[rng.choice(COLORS) for _ in range(3)] for _ in range(3)]
+            WORLD.reset(layout)
+            a = [90 + rng.uniform(-6, 6), 112 + rng.uniform(-5, 5), 15 + rng.uniform(-5, 5), 1 + rng.uniform(0, 6), 90]
+            frame = sim_world.arm_view(a, seed=k)
+            vision.forget()
+            corners = vision.find_grid(frame)
+            good += (corners is not None and self.err(corners, sim_world.true_corners("S", a)) < 30
+                     and vision.detect_full(frame, corners)["colors"] == layout)
+        self.assertGreaterEqual(good, 5)
+
+    def test_partial_grid_points_the_way(self):
+        """Se vede doar o parte (baza rotită): caroiajul e extrapolat în afara imaginii, cu centrul pe partea bună."""
+        for layout in ([[None] * 3 for _ in range(3)], self.HALF):
+            WORLD.reset(layout)
+            for base in (66, 118):
+                a = [base, 108, 18, 4, 90]
+                frame = sim_world.arm_view(a, seed=1)
+                truth = np.float32(sim_world.true_corners("S", a))
+                self.assertTrue(((truth < 0) | (truth > [640, 480])).any(), "caroiajul trebuie să iasă din imagine")
+                vision.forget()
+                part = vision.find_partial_grid(frame)
+                if part is None:
+                    hint = vision.lines_hint(frame)
+                    self.assertIsNotNone(hint, f"baza {base}: nici parțial, nici linii")
+                    got = np.float32(hint) * [640, 480]
+                else:
+                    got = np.float32(part).mean(0)
+                want = truth.mean(0)
+                # spre stânga / dreapta ca în realitate (semnul față de mijlocul imaginii)
+                self.assertEqual(np.sign(got[0] - 320), np.sign(want[0] - 320), f"baza {base}, {layout == self.HALF}")
+
+    def test_no_lines_on_empty_table(self):
+        self.assertIsNone(vision.lines_hint(synth.render([[None] * 3 for _ in range(3)], paper=False)))
+        self.assertIsNone(vision.find_partial_grid(synth.render([[None] * 3 for _ in range(3)], paper=False)))
+
+    def test_aim_from_corner(self):
+        """Brațul vede doar un colț al caroiajului: se mută până îl vede întreg, centrat. A doua oară pornește
+        cu efectul articulațiilor ținut minte (data/aim.json), fără mișcări de probă."""
+        from dofbot import aim
+        old = aim.JACOBIAN_FILE
+        aim.JACOBIAN_FILE = os.path.join(C.CAPTURES_DIR, "aim.json")
+        try:
+            for start in ([68, 108, 18, 4, 90], [114, 112, 15, 1, 90]):
+                WORLD.reset(self.HALF)
+                vision.forget()
+                rob = Robot()
+                rob.move(start, 200)
+                final = aim.Aimer(rob, lambda: sim_world.arm_view(rob.last, seed=len(rob.arm.history)),
+                                  lambda m: None, need_cubes=1).run(search=False, center=True)
+                self.assertIsNotNone(final, f"de la {start}")
+                t = np.float32(sim_world.true_corners("S", final)) / [640, 480]
+                self.assertTrue(((t > 0.02) & (t < 0.98)).all(), f"de la {start}: caroiajul nu e întreg în imagine")
+                self.assertLess(np.abs(t.mean(0) - 0.5).max(), 0.12)
+            self.assertTrue(os.path.exists(aim.JACOBIAN_FILE))
+        finally:
+            aim.JACOBIAN_FILE = old
+
+
+class TestMotion(unittest.TestCase):
+    """Mișcarea lină a lui Robot.move, văzută prin comenzile primite de brațul simulat."""
+
+    def sent(self, rob):
+        return [np.float64(a[:5]) for _, a in rob.arm.history]
+
+    def test_move_is_smooth_and_exact(self):
+        rob = Robot()
+        rob.last = [90.0] * 5
+        rob.arm.history.clear()
+        target = [130, 60, 100, 75, 90]
+        rob.move(target, 600)
+        pts = [np.float64([90] * 5)] + self.sent(rob)
+        steps = np.array([np.abs(b - a).max() for a, b in zip(pts, pts[1:])])
+        np.testing.assert_allclose(pts[-1], target, atol=0.05)
+        self.assertLessEqual(steps.max(), C.V_MAX / C.MOTION_HZ * 1.01)          # viteza maximă respectată
+        self.assertLess(steps[0], 0.1 * steps.max())                             # pornește lin
+        self.assertLess(steps[-1], 0.1 * steps.max())                            # oprește lin
+        self.assertGreaterEqual(len(steps), 0.6 * C.MOTION_HZ)                   # 40° la 90°/s: ≥ 0,83 s
+        # Toate articulațiile ajung odată: la jumătatea drumului, fiecare e la jumătatea propriei distanțe.
+        mid, moving = pts[len(pts) // 2], np.float64(target) != 90
+        np.testing.assert_allclose((mid - 90)[moving] / (np.float64(target) - 90)[moving], 0.5, atol=0.06)
+
+    def test_stop_mid_move(self):
+        calls = {"n": 0}
+
+        def stop():
+            calls["n"] += 1
+            return calls["n"] > 10
+        rob = Robot(should_stop=stop)
+        rob.last = [90.0] * 5
+        rob.arm.history.clear()
+        with self.assertRaises(Stopped):
+            rob.move([150, 90, 90, 90, 90], 1000)
+        self.assertLessEqual(len(rob.arm.history), 10)    # nu mai trimite niciun punct după Stop
+
+    def test_limits(self):
+        rob = Robot()
+        rob.last = [90.0] * 5
+        with self.assertRaises(ValueError):
+            rob.move([200, 90, 90, 90, 90])               # mult în afară: greșeală, nu se mișcă
+        rob.move([182, 90, 90, 90, -1], 200)              # puțin în afară: adus la limită
+        self.assertEqual(rob.last[0], 180)
+        self.assertEqual(rob.last[4], 0)
 
 
 class TestTasksSimulated(unittest.TestCase):

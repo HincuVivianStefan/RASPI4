@@ -23,7 +23,7 @@ from dofbot.robot import REQUIRED, load_positions  # noqa: E402
 
 KEYS = {"q": (0, 1), "a": (0, -1), "w": (1, 1), "s": (1, -1), "e": (2, 1),
         "d": (2, -1), "r": (3, 1), "f": (3, -1), "t": (4, 1), "g": (4, -1)}
-LIMITS = [(0, 180), (0, 180), (0, 180), (0, 180), (0, 270)]
+LIMITS = C.LIMITS
 
 try:
     import msvcrt   # Windows
