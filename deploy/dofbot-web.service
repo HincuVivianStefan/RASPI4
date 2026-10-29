@@ -1,0 +1,21 @@
+# Pornire automată la boot pe Raspberry Pi (pagina web + camera + brațul).
+# Schimbă User și calea /home/pi/concurs dacă la voi sunt altele, apoi:
+#   sudo cp deploy/dofbot-web.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now dofbot-web
+# Jurnal: journalctl -u dofbot-web -f      Oprire: sudo systemctl stop dofbot-web
+[Unit]
+Description=DOFBOT - pagina web
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=pi
+WorkingDirectory=/home/pi/concurs
+ExecStart=/usr/bin/python3 -m dofbot.web
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

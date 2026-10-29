@@ -1,0 +1,635 @@
+<!doctype html>
+<html lang="ro">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DOFBOT – monitor</title>
+<style>
+  /* Stil retro, pixelat: culori plate, margini groase, umbre fără blur, fără animații (ușor pentru Pi). */
+  :root {
+    --ink: #2a3553; --muted: #5d6886; --paper: #fdfdff;
+    --blue: #c1d7ee; --blue-dk: #8fb0d9; --blue-lt: #e7eaf6;
+    --cream: #fff8e2; --butter: #ffefb9; --butter-dk: #e6cf85;
+    --pink: #eed9ea; --pink-dk: #d4aecd;
+    --danger: #b3263e; --ok: #23633a; --ok-bg: #d3ecd5; --warn: #7a5600;
+    --bevel: inset -2px -2px 0 rgba(42, 53, 83, .25);
+    --mono: Consolas, "DejaVu Sans Mono", "Courier New", monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 13px/1.45 var(--mono); color: var(--ink); background-color: var(--blue-lt);
+         background-image: linear-gradient(var(--blue) 1px, transparent 1px), linear-gradient(90deg, var(--blue) 1px, transparent 1px);
+         background-size: 16px 16px; }
+  .spacer { flex: 1; }
+  .muted { color: var(--muted); font-size: 12px; }
+  .row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 6px 0; }
+
+  /* bara de sus, ca meniul unui sistem de operare vechi */
+  header { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 6px 14px;
+           background: var(--paper); border-bottom: 3px solid var(--ink); position: sticky; top: 0; z-index: 5; }
+  header h1 { display: flex; align-items: center; gap: 8px; font-size: 18px; letter-spacing: 2px; margin: 0 10px 0 0;
+              text-shadow: 2px 2px 0 var(--pink-dk); }
+  header h1 small { font-size: 12px; letter-spacing: 1px; color: var(--muted); text-shadow: none; font-weight: normal; }
+  .logo { width: 16px; height: 16px; border: 2px solid var(--ink); flex: none;
+          background: conic-gradient(var(--blue) 25%, var(--butter) 0 50%, var(--pink) 0 75%, var(--cream) 0); }
+  .badge { padding: 1px 7px; border: 2px solid var(--ink); background: var(--cream); font-size: 12px; white-space: nowrap; }
+  .badge.ok { background: var(--ok-bg); color: var(--ok); }
+  .badge.bad { background: var(--pink); color: var(--danger); font-weight: bold; }
+  .badge.warn { background: var(--butter); color: var(--warn); }
+
+  main { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(320px, 1fr); gap: 18px; padding: 16px; }
+  @media (max-width: 900px) { main { grid-template-columns: minmax(0, 1fr); } }
+
+  /* butoane și câmpuri */
+  button { font: inherit; color: var(--ink); padding: 4px 10px; background: var(--cream); border: 2px solid var(--ink);
+           border-radius: 0; box-shadow: var(--bevel); cursor: pointer; }
+  button:hover:not(:disabled) { background: var(--butter); }
+  button:active:not(:disabled), button.on, button.on:hover { background: var(--blue); box-shadow: inset 2px 2px 0 var(--blue-dk); }
+  button.primary { background: var(--butter); font-weight: bold; }
+  button.primary:hover:not(:disabled) { background: #ffe596; }
+  button.danger { background: var(--pink); color: var(--danger); font-weight: bold; }
+  button.danger:hover:not(:disabled) { background: var(--pink-dk); }
+  button:disabled { opacity: .45; cursor: default; }
+  select, input[type=number] { font: inherit; color: var(--ink); background: var(--paper); border: 2px solid var(--ink);
+                               border-radius: 0; padding: 2px 4px; }
+  input[type=checkbox], input[type=range] { accent-color: var(--ink); }
+  summary { cursor: pointer; }
+
+  /* calculatorul în care stă camera */
+  .pc { background: var(--cream); border: 3px solid var(--ink); padding: 12px 12px 0; box-shadow: 5px 5px 0 var(--blue-dk); }
+  .pc-bezel { background: var(--butter); border: 3px solid var(--ink); padding: 10px; box-shadow: inset 3px 3px 0 var(--butter-dk); }
+  .pc-screen { border: 3px solid var(--ink); background: #10162a; }
+  .scr-bar { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 2px 10px; padding: 2px 8px;
+             background: var(--blue); border-bottom: 3px solid var(--ink); font-size: 11px; line-height: 1.4; }
+  .scr-bar b { text-transform: uppercase; letter-spacing: 1px; }
+  .pc-chin { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 8px 2px 10px; }
+  .pc-name { font-weight: bold; font-size: 12px; letter-spacing: 2px; text-transform: uppercase; }
+  .led { width: 12px; height: 12px; border: 2px solid var(--ink); background: #ffe27a; flex: none; }
+  .led.frozen { background: var(--pink-dk); }
+  .led.off { background: #9aa3b8; }
+  .slot { width: 64px; height: 7px; background: var(--ink); box-shadow: 0 2px 0 var(--butter-dk); flex: none; }
+  .pc-neck { width: 18%; min-width: 60px; height: 14px; margin: 0 auto; background: var(--butter);
+             border: 3px solid var(--ink); border-top: 0; }
+  .pc-foot { width: 44%; min-width: 140px; height: 14px; margin: 0 auto 18px; background: var(--cream);
+             border: 3px solid var(--ink); box-shadow: 5px 5px 0 var(--blue-dk); }
+  .imgwrap { position: relative; line-height: 0; }
+  .imgwrap img { display: block; width: 100%; background: #000; cursor: crosshair; }
+  .dot { position: absolute; width: 12px; height: 12px; margin: -6px 0 0 -6px; background: #ff1744;
+         border: 2px solid #fff; outline: 1px solid #000; pointer-events: none; }
+
+  /* ferestrele */
+  .win { background: var(--paper); border: 3px solid var(--ink); box-shadow: 5px 5px 0 var(--blue-dk); margin-bottom: 18px; }
+  .tbar { display: flex; align-items: center; gap: 8px; padding: 3px 8px; background: var(--blue); border-bottom: 3px solid var(--ink); }
+  .tbar::before { content: ""; width: 10px; height: 10px; border: 2px solid var(--ink); background: var(--paper); flex: none; }
+  .tbar h2 { flex: 1; margin: 0; font-size: 13px; letter-spacing: 1px; text-transform: uppercase; }
+  .tbar button { padding: 0 8px; }
+  .tbar .tsmall { font-size: 12px; }
+  .win.yellow .tbar { background: var(--butter); }
+  .win.pink .tbar { background: var(--pink); }
+  .wbody { padding: 10px 12px; }
+  .wbody h3 { margin: 14px 0 6px; padding-bottom: 3px; font-size: 12px; letter-spacing: 1px; text-transform: uppercase;
+              border-bottom: 2px dashed var(--blue-dk); }
+  .wbody h3:first-child { margin-top: 0; }
+  .tabs { display: flex; gap: 6px; margin-bottom: 14px; }
+  .tabs button { flex: 1; padding: 6px 10px; font-weight: bold; letter-spacing: 1px; text-transform: uppercase; }
+
+  /* caroiajele 3×3: fundalul închis face liniile dintre celule */
+  .g3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 3px; padding: 3px; width: 100%; max-width: 240px; background: var(--ink); }
+  .g3 div { aspect-ratio: 1.4; display: flex; flex-direction: column; justify-content: center; align-items: center;
+            font-size: 11px; font-weight: bold; text-align: center; }
+  .g3 .sub { font-weight: normal; font-size: 10px; opacity: .85; }
+  .g3.pick div { cursor: pointer; }
+  .g3 .err { outline: 3px solid var(--danger); outline-offset: -3px; }
+  .grids { display: flex; gap: 14px; flex-wrap: wrap; }
+  .grids > div { flex: 1; min-width: 150px; }
+  .thumbs { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px; }
+  .thumbs img { display: block; width: 100%; background: #000; border: 2px solid var(--ink); }
+  .chip { display: inline-flex; gap: 4px; align-items: center; padding: 1px 6px; border: 2px solid var(--ink); font-size: 12px; font-weight: bold; }
+  .chip button { padding: 0 4px; border: 0; background: transparent; box-shadow: none; color: inherit; }
+
+  pre.log { height: 220px; overflow: auto; margin: 0; padding: 8px 10px; background: var(--ink); color: var(--cream);
+            font: 12px/1.4 var(--mono); white-space: pre-wrap; }
+  table.colors { border-collapse: collapse; font-size: 12px; }
+  table.colors td, table.colors th { padding: 2px 3px; }
+  table.colors input { width: 54px; }
+  label.f { display: grid; grid-template-columns: 190px 1fr; gap: 6px; align-items: center; margin: 4px 0; }
+  label.f .slider { display: flex; gap: 8px; align-items: center; }
+  label.f input[type=range] { flex: 1; }
+  label.f output { width: 44px; text-align: right; font-variant-numeric: tabular-nums; }
+  #toast { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); display: none; z-index: 10; max-width: 90vw;
+           padding: 8px 14px; background: var(--cream); color: var(--ink); border: 3px solid var(--ink); box-shadow: 4px 4px 0 var(--blue-dk); }
+  #toast.err { background: var(--pink); color: var(--danger); }
+  .pause { background: var(--butter); border: 2px solid var(--ink); padding: 6px 8px; margin: 6px 0; }
+  #armcv { display: block; width: 100%; max-width: 420px; height: auto; background: var(--blue-lt); border: 2px solid var(--ink); }
+</style>
+</head>
+<body>
+<header>
+  <h1><span class="logo"></span>DOFBOT <small>monitor</small></h1>
+  <select id="src" title="sursa imaginii" onchange="post('camera', {source: this.value})">
+    <option value="camera:0">Camera 0</option><option value="camera:1">Camera 1</option>
+    <option value="camera:2">Camera 2</option><option value="camera:3">Camera 3</option>
+    <option value="synth">Scenă simulată</option>
+  </select>
+  <span class="badge" id="b-src"></span>
+  <span class="badge" id="b-arm"></span>
+  <span class="badge" id="b-grid"></span>
+  <span class="badge" id="b-task"></span>
+  <span class="badge" id="b-ms"></span>
+  <span class="spacer"></span>
+  <button onclick="post('snapshot')">Salvează poze</button>
+  <a href="/frame.jpg" download="cadru.jpg"><button>Descarcă cadrul</button></a>
+  <button class="danger" onclick="if (confirm('Reset: oprește sarcina, șterge memoria și jurnalul?')) post('reset')">Reset</button>
+</header>
+
+<main>
+  <section>
+    <div class="pc">
+      <div class="pc-bezel">
+        <div class="pc-screen">
+          <div class="scr-bar"><b>Camera · detecția desenată</b><span id="clickmode"></span></div>
+          <div class="imgwrap" id="camwrap"><img id="cam" src="/stream/cam" alt="camera" draggable="false"></div>
+        </div>
+      </div>
+      <div class="pc-chin">
+        <span class="pc-name">DOFBOT · Pi 4</span>
+        <span class="led" id="led" title="live"></span>
+        <span class="slot"></span>
+        <span class="spacer"></span>
+        <button id="freeze" onclick="post('freeze')">Îngheață</button>
+        <label><input type="checkbox" id="rejected" onchange="post('view', {rejected: this.checked})"> Arată petele respinse (gri)</label>
+      </div>
+    </div>
+    <div class="pc-neck"></div>
+    <div class="pc-foot"></div>
+
+    <div class="win pink">
+      <div class="tbar"><h2>Sondă HSV și depanare</h2></div>
+      <div class="wbody">
+        <div class="row" id="probe"><span class="muted">Click pe imagine ca să citești valorile HSV ale unui punct.</span></div>
+        <details id="more">
+          <summary class="muted">Vederi de depanare: caroiajul văzut de sus și măștile de culoare</summary>
+          <div class="thumbs">
+            <div><div class="muted">Caroiaj îndreptat (cuburile găsite)</div><img id="img-top" alt="caroiaj"></div>
+            <div><div class="muted">Mască: <select id="mask" onchange="post('view', {mask: this.value})"></select></div><img id="img-mask" alt="masca"></div>
+          </div>
+        </details>
+      </div>
+    </div>
+    <div class="win">
+      <div class="tbar"><h2>Jurnal</h2></div>
+      <pre class="log" id="log"></pre>
+    </div>
+  </section>
+
+  <section>
+    <div class="tabs">
+      <button id="t-task1" onclick="setMode('task1')">Sarcina 1</button>
+      <button id="t-task2" onclick="setMode('task2')">Sarcina 2</button>
+      <button id="t-set" onclick="showSettings()">Setări</button>
+    </div>
+
+    <div class="win">
+      <div class="tbar">
+        <h2>Detecție</h2>
+        <span class="tsmall">Caroiaj: <button id="g-S" onclick="post('grid', {grid:'S'})">S</button> <button id="g-D" onclick="post('grid', {grid:'D'})">D</button></span>
+      </div>
+      <div class="wbody">
+        <div class="grids">
+          <div><div class="muted">Cadrul curent</div><div class="g3" id="live"></div></div>
+          <div><div class="muted" id="stable-lbl">Stabil</div><div class="g3" id="stable"></div></div>
+        </div>
+        <div class="muted" id="det-info"></div>
+      </div>
+    </div>
+
+    <div class="win" id="p-task1">
+      <div class="tbar"><h2>Sarcina 1 – reproducerea aranjării</h2></div>
+      <div class="wbody">
+        <div class="muted">Test fără braț: memorează sursa, aranjează destinația, apoi verifică.</div>
+        <div class="row">
+          <button onclick="post('memorize')">Memorează aranjarea</button>
+          <button onclick="post('verify')">Verifică față de memorie</button>
+        </div>
+        <div class="grids">
+          <div><div class="muted">Memorat</div><div class="g3" id="mem"></div></div>
+          <div><div class="muted" id="ver-lbl">Verificare</div><div class="g3" id="ver"></div></div>
+        </div>
+        <label class="f">Ordinea rândurilor (destinație)
+          <select id="roworder" onchange="setVal({S1_ROW_ORDER: this.value.split(',').map(Number)})">
+            <option value="1,2,3">R1, R2, R3</option><option value="3,2,1">R3, R2, R1</option>
+          </select></label>
+      </div>
+    </div>
+
+    <div class="win" id="p-task2">
+      <div class="tbar"><h2>Sarcina 2 – turnul sortat</h2></div>
+      <div class="wbody">
+        <div class="muted">Ordinea, de JOS în SUS (click pe o culoare ca să o adaugi):</div>
+        <div class="row" id="palette"></div>
+        <div class="row" id="order"></div>
+        <div class="grids">
+          <div><div class="muted">Celula turnului (click)</div><div class="g3 pick" id="target"></div></div>
+          <div><div class="muted">Plan pe detecția stabilă</div><div id="plan2" class="muted"></div></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="win yellow" id="p-run">
+      <div class="tbar"><h2>Rulare</h2></div>
+      <div class="wbody">
+        <div class="row">
+          <button class="primary" id="run" onclick="post('run', {task: state.mode})">Rulează</button>
+          <button id="stop" onclick="post('stop')">Stop</button>
+          <button id="cont" onclick="post('continue')">Continuă</button>
+          <label><input type="checkbox" id="pause" onchange="setVal({PAUSE_BETWEEN_PHASES: this.checked})"> Pauză între faze</label>
+        </div>
+        <div id="pausebox"></div>
+        <div class="muted" id="posinfo"></div>
+      </div>
+    </div>
+
+    <div class="win" id="p-arm">
+      <div class="tbar"><h2>Braț</h2><span class="spacer"></span><span class="badge" id="b-pad"></span></div>
+      <div class="wbody">
+        <div class="row">
+          <button class="primary" id="aim" onclick="post('aim')" title="privește în față și mișcă umărul / cotul / încheietura până vede caroiajul cu cuburi; salvează unghiurile (LOOK_S / LOOK_D) și memorează cuburile">Pasul 1: găsește caroiajul</button>
+          <button class="danger" id="estop" onclick="post('stop')">STOP</button>
+          <span class="muted">sau orice buton de pe controller</span>
+        </div>
+        <div id="notice"></div>
+        <div class="grids">
+          <div><canvas id="armcv" width="420" height="190"></canvas></div>
+          <div style="max-width:170px"><div class="muted">Memorat</div><div class="g3" id="mem2"></div></div>
+        </div>
+        <div class="muted" id="arminfo"></div>
+      </div>
+    </div>
+
+    <div class="win pink" id="p-set" style="display:none">
+      <div class="tbar"><h2>Setări detecție</h2></div>
+      <div class="wbody">
+        <div id="numfields"></div>
+        <h3>Intervale HSV (H 0–179, S 0–255, V 0–255)</h3>
+        <div id="colorsbox"></div>
+        <div class="row">
+          <button class="primary" onclick="post('settings/save')">Salvează în settings.json</button>
+          <button onclick="post('settings/defaults').then(loadSettings)">Valori implicite</button>
+        </div>
+        <div class="muted">Schimbările se văd imediat pe imagine; fără „Salvează” se pierd la repornire.</div>
+        <h3>Colțurile caroiajului (rezervă când nu e găsit automat)</h3>
+        <div class="row">
+          <button onclick="startCorners()">Colțuri manuale (4 click-uri)</button>
+          <span class="muted">sau trage de punctele roșii de pe imagine</span>
+          <button onclick="post('corners', {grid: state.vision.grid, corners: null})">Șterge colțurile salvate</button>
+        </div>
+        <div class="muted" id="cornerinfo"></div>
+        <div id="synthbox" style="display:none">
+          <h3>Scena sintetică (fără cameră)</h3>
+          <div class="muted">Click pe o celulă schimbă culoarea. „Aplică” pune cuburile pe S și golește D.</div>
+          <div class="g3 pick" id="synth"></div>
+          <div class="row"><button onclick="post('synth', {layout: synthLayout})">Aplică scena</button></div>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+<div id="toast"></div>
+
+<script>
+let state = null, settingsShown = false, cornerClicks = null, synthLayout = null, toastT = 0;
+const NUM = [   // cheie, etichetă, min, max, pas
+  ["CUBE_MIN_AREA", "cub: arie minimă (× celulă)", 0.02, 1, 0.01], ["CUBE_MAX_AREA", "cub: arie maximă (× celulă)", 0.3, 3, 0.05],
+  ["CUBE_MAX_ASPECT", "cub: alungire maximă", 1, 3, 0.05], ["CUBE_MIN_FILL", "cub: umplere minimă", 0.3, 1, 0.01],
+  ["MIN_FRACTION", "fracțiune minimă culoare", 0.05, 0.95, 0.01], ["PATCH", "petic analizat (din celulă)", 0.15, 0.95, 0.01],
+  ["STABLE_FRAMES", "cadre pentru vot", 1, 30, 1], ["GRID_C", "contrast linii caroiaj", 1, 60, 1],
+  ["GRID_MAX_S", "saturație max. linii", 0, 255, 1], ["GRID_MIN_AREA", "arie min. caroiaj", 0.005, 0.5, 0.005],
+  ["GRID_MIN_SCORE", "scor min. caroiaj", 0, 1, 0.01], ["GRID_MIN_LINE", "linie interioară minimă", 0, 1, 0.01],
+  ["GRID_MAX_RATIO", "proporție max. caroiaj", 1, 4, 0.1],
+];
+let applyT = 0, dragCorners = null, dragIdx = -1, dragMoved = false;
+const $ = id => document.getElementById(id);
+
+function toast(text, err) {
+  const t = $("toast"); t.textContent = text; t.className = err ? "err" : ""; t.style.display = "block";
+  clearTimeout(toastT); toastT = setTimeout(() => t.style.display = "none", 3500);
+}
+async function post(action, body, quiet) {
+  const r = await fetch("/api/" + action, {method: "POST", headers: {"Content-Type": "application/json"},
+                                         body: JSON.stringify(body || {})});
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) toast(j.error || ("Eroare " + r.status), true);
+  else if (j.message && !quiet) toast(j.message);
+  refresh();
+  return j;
+}
+const setVal = values => post("settings", {values});
+
+function hex(c) { return (state && state.colors_hex[c]) || "#e7eaf6"; }
+function fg(c) { return (!c || c === "galben") ? "#111" : "#fff"; }
+// Pe ce parte e fața colorată a cubului (vision.FACES); „sus” = cubul stă normal și nu se mai scrie.
+const FACE_TXT = {fata: "din față", spate: "din spate", stanga: "din stânga", dreapta: "din dreapta"};
+const faceTxt = (faces, r, c) => faces && faces[r][c] && faces[r][c] !== "sus" ? ` · ${FACE_TXT[faces[r][c]] || faces[r][c]}` : "";
+
+function drawGrid(el, g, opts = {}) {
+  el.innerHTML = "";
+  for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++) {
+    const v = g ? g[r][c] : null, d = document.createElement("div");
+    d.style.background = hex(v);
+    d.style.color = fg(v);
+    d.innerHTML = `${r + 1}${c + 1}<span class="sub">${opts.label ? opts.label(r, c, v) : (v || "–")}</span>`;
+    if (opts.err && opts.err.some(([er, ec]) => er === r + 1 && ec === c + 1)) d.classList.add("err");
+    if (opts.title) d.title = opts.title(r, c);
+    if (opts.click) d.onclick = () => opts.click(r, c);
+    el.appendChild(d);
+  }
+}
+
+function setMode(m) { settingsShown = false; post("mode", {mode: m}); }
+function showSettings() { settingsShown = true; loadSettings(); render(); }
+
+function loadSettings() {
+  fetch("/api/state").then(r => r.json()).then(s => {
+    state = s;
+    const st = s.settings;
+    $("numfields").innerHTML = NUM.map(([k, lbl, lo, hi, step]) =>
+      `<label class="f" title="${k}">${lbl} <span class="slider"><input type="range" id="n-${k}" min="${lo}" max="${hi}" step="${step}" value="${st[k]}"><output id="o-${k}">${st[k]}</output></span></label>`
+    ).join("") + `<label class="f">caroiaj automat <span><input type="checkbox" id="n-AUTO_GRID" ${st.AUTO_GRID ? "checked" : ""}></span></label>`
+      + `<label class="f" title="CUBE_MODE">cuburi ca obiecte <span><input type="checkbox" id="n-CUBE_MODE" ${st.CUBE_MODE ? "checked" : ""}> <span class="muted">debifat = metoda veche, procent de pixeli</span></span></label>`;
+    let h = "<table class='colors'><tr><th></th><th colspan=3>min H S V</th><th colspan=3>max H S V</th><th></th></tr>";
+    for (const [name, ranges] of Object.entries(st.COLORS)) ranges.forEach((rg, i) => {
+      h += `<tr data-c="${name}"><td><span class="chip" style="background:${hex(name)};color:${fg(name)}">${name}</span></td>` +
+        rg[0].concat(rg[1]).map(v => `<td><input type="number" value="${v}"></td>`).join("") +
+        `<td><button title="șterge intervalul" onclick="removeRange(this)">×</button></td></tr>`;
+    });
+    $("colorsbox").innerHTML = h + "</table>";
+    synthLayout = JSON.parse(JSON.stringify(st.SYNTH_LAYOUT));
+    render();
+  });
+}
+// Reglajele se aplică imediat ce le schimbi (pe disc ajung doar cu "Salvează").
+function readColors() {
+  const colors = {};
+  document.querySelectorAll("#colorsbox tr[data-c]").forEach(tr => {
+    const v = [...tr.querySelectorAll("input")].map(i => Number(i.value));
+    (colors[tr.dataset.c] ||= []).push([v.slice(0, 3), v.slice(3)]);
+  });
+  return colors;
+}
+function applyLive(values) {
+  clearTimeout(applyT);
+  applyT = setTimeout(() => post("settings", {values}, true), 120);
+}
+$("numfields").addEventListener("input", e => {
+  const k = e.target.id.slice(2);
+  if (e.target.type === "range") { $("o-" + k).textContent = e.target.value; applyLive({[k]: Number(e.target.value)}); }
+  else applyLive({[k]: e.target.checked});
+});
+$("colorsbox").addEventListener("input", () => applyLive({COLORS: readColors()}));
+function removeRange(btn) { btn.closest("tr").remove(); applyLive({COLORS: readColors()}); }
+
+// ---- click pe imaginea camerei: HSV sau colțuri
+function startCorners() { cornerClicks = []; drawDots(); toast("Click pe colțuri: stânga-sus, dreapta-sus, dreapta-jos, stânga-jos"); }
+function drawDots() {
+  document.querySelectorAll("#camwrap .dot").forEach(d => d.remove());
+  $("clickmode").textContent = cornerClicks ? `Colțuri ${state.vision.grid}: click ${cornerClicks.length + 1}/4`
+    : "Click = citește HSV · trage de un colț roșu ca să-l muți";
+  const pts = cornerClicks || dragCorners;
+  if (!pts) return;
+  const [W, H] = state.vision.frame_size;
+  pts.forEach(([x, y]) => {
+    const d = document.createElement("div"); d.className = "dot";
+    d.style.left = (x / W * 100) + "%"; d.style.top = (y / H * 100) + "%"; $("camwrap").appendChild(d);
+  });
+}
+function framePos(e) {
+  const [W, H] = state.vision.frame_size, r = $("cam").getBoundingClientRect();
+  return [Math.round((e.clientX - r.left) / r.width * W), Math.round((e.clientY - r.top) / r.height * H), r.width / W];
+}
+$("cam").addEventListener("pointerdown", e => {
+  if (!state || !state.vision.corners || cornerClicks) return;
+  const [x, y, scale] = framePos(e);
+  dragIdx = state.vision.corners.findIndex(([cx, cy]) => Math.hypot(cx - x, cy - y) * scale < 15);
+  if (dragIdx < 0) return;
+  e.preventDefault();
+  $("cam").setPointerCapture(e.pointerId);
+  dragCorners = state.vision.corners.map(p => p.map(Math.round));
+  dragMoved = false;
+  drawDots();
+});
+$("cam").addEventListener("pointermove", e => {
+  if (dragIdx < 0) return;
+  const [x, y] = framePos(e);
+  dragCorners[dragIdx] = [x, y]; dragMoved = true; drawDots();
+});
+$("cam").addEventListener("pointerup", () => {
+  if (dragIdx < 0) return;
+  const corners = dragCorners, moved = dragMoved;
+  dragIdx = -1; dragCorners = null; drawDots();
+  if (moved) post("corners", {grid: state.vision.grid, corners}).then(() => settingsShown && loadSettings());
+});
+$("cam").onclick = async e => {
+  if (!state || !state.vision.frame_size) return;
+  if (dragMoved) { dragMoved = false; return; }   // a fost tragere, nu click
+  const [x, y] = framePos(e);
+  if (cornerClicks) {
+    cornerClicks.push([x, y]); drawDots();
+    if (cornerClicks.length === 4) {
+      const corners = cornerClicks; cornerClicks = null; drawDots();
+      post("corners", {grid: state.vision.grid, corners});
+    }
+    return;
+  }
+  const r = await post("probe", {x, y});
+  if (!r.hsv) return;
+  const opts = Object.keys(state.colors_hex).map(c => `<option>${c}</option>`).join("");
+  $("probe").innerHTML = `<b>(${r.x}, ${r.y})</b> HSV = ${r.hsv.join(", ")} → ${r.match.join(", ") || "nicio culoare"}
+    <span class="muted">Lărgește intervalul pentru</span> <select id="learnc">${opts}</select>
+    <button onclick="post('learn', {x:${r.x}, y:${r.y}, color: $('learnc').value}).then(() => settingsShown && loadSettings())">Învață</button>`;
+};
+
+// ---- afișare
+function render() {
+  const s = state; if (!s) return;
+  const v = s.vision, t = s.task, st = s.settings;
+  if (![...$("src").options].some(o => o.value === s.source)) $("src").add(new Option(s.source, s.source));
+  if (document.activeElement !== $("src")) $("src").value = s.source;
+  $("b-src").textContent = s.camera_error ? "imagine: " + s.camera_error : "imagine OK";
+  $("b-src").className = "badge " + (s.camera_error ? "bad" : "ok");
+  $("b-arm").textContent = "braț: " + (s.sim ? "simulat" : "REAL"); $("b-arm").className = "badge " + (s.sim ? "warn" : "ok");
+  $("b-grid").textContent = v.corners ? `caroiaj ${v.grid}: ${v.corner_src === "auto" ? "găsit automat" : "colțuri salvate"}` : `caroiaj ${v.grid}: NEGĂSIT`;
+  $("b-grid").className = "badge " + (v.corners ? "ok" : "bad");
+  $("b-task").textContent = "sarcină: " + t.status + (t.name ? ` (${t.name})` : "");
+  $("b-task").className = "badge " + ({"rulează": "ok", "pauză": "warn", "eroare": "bad"}[t.status] || "");
+  $("b-ms").textContent = `flux ${v.stream_fps ?? "–"} cadre/s · detecție ${v.ms ?? "–"} ms`;
+  $("freeze").textContent = v.frozen ? "Pornește live" : "Îngheață";
+  $("freeze").className = v.frozen ? "on" : "";
+  // LED-ul de pe calculator: galben = live, roz = înghețat, gri = fără imagine
+  $("led").className = "led" + (s.camera_error ? " off" : v.frozen ? " frozen" : "");
+  $("led").title = s.camera_error ? "fără imagine" : v.frozen ? "imagine înghețată" : "live";
+  if (!$("clickmode").textContent) drawDots();
+
+  $("t-task1").className = !settingsShown && s.mode === "task1" ? "on" : "";
+  $("t-task2").className = !settingsShown && s.mode === "task2" ? "on" : "";
+  $("t-set").className = settingsShown ? "on" : "";
+  $("p-task1").style.display = !settingsShown && s.mode === "task1" ? "" : "none";
+  $("p-task2").style.display = !settingsShown && s.mode === "task2" ? "" : "none";
+  $("p-run").style.display = settingsShown ? "none" : "";
+  $("p-set").style.display = settingsShown ? "" : "none";
+  $("g-S").className = v.grid === "S" ? "on" : ""; $("g-D").className = v.grid === "D" ? "on" : "";
+
+  const cellCubes = (r, c) => (v.cubes || []).filter(o => o.cell === `${r + 1}${c + 1}`);
+  const fracTitle = (r, c) => (cellCubes(r, c).map(o =>
+      `cub ${o.color}` + (o.face && o.face !== "sus" ? ` (culoarea pe latura ${FACE_TXT[o.face] || o.face}, sus e alb)` : "") +
+      `: arie ${o.area}, alungire ${o.aspect}, unghi ${o.angle}°`).join("\n") || "niciun cub") +
+    (v.fracs ? "\npixeli: " + Object.entries(v.fracs[r][c]).map(([k, f]) => `${k} ${f.toFixed(2)}`).join(", ") : "");
+  drawGrid($("live"), v.colors, {title: fracTitle,
+    label: (r, c, x) => {
+      if (v.fracs) return `${x || "–"} ${Math.max(...Object.values(v.fracs[r][c])).toFixed(2)}`;
+      return x ? "cub " + x + faceTxt(v.faces, r, c) : "–";
+    }});
+  $("stable-lbl").textContent = `Stabil (vot pe ${st.STABLE_FRAMES} cadre)`;
+  drawGrid($("stable"), v.stable, {label: (r, c, x) => x ? "cub " + x + faceTxt(v.stable_faces, r, c) : "–",
+    title: (r, c) => v.stable && v.stable[r][c] ? (faceTxt(v.stable_faces, r, c) ?
+      `culoarea e pe latura ${FACE_TXT[v.stable_faces[r][c]]}, sus e alb (cub întors)` : "culoarea e sus") : "gol"});
+  const cnt = {}; (v.stable || []).flat().forEach(x => x && (cnt[x] = (cnt[x] || 0) + 1));
+  const why = {}; (v.rejected || []).forEach(o => why[o.reason] = (why[o.reason] || 0) + 1);
+  $("det-info").textContent = (Object.entries(cnt).map(([k, n]) => `${k}: ${n}`).join("  ") || "niciun cub") +
+    (st.CUBE_MODE ? ` · obiecte: ${(v.cubes || []).length} cuburi, ${(v.rejected || []).length} pete respinse` +
+       (Object.keys(why).length ? " (" + Object.entries(why).map(([k, n]) => `${k}: ${n}`).join(", ") + ")" : "")
+     : ` · metoda pixeli, prag ${st.MIN_FRACTION}`) + " · mouse peste o celulă = detalii";
+
+  // Sarcina 1
+  const pub = t.published || {};
+  drawGrid($("mem"), s.memorized || pub.source);
+  const ver = s.verify ? s.verify.now : pub.dest, err = s.verify ? s.verify.errors : (t.result && t.result.errors);
+  drawGrid($("ver"), ver, {err: err || []});
+  $("ver-lbl").textContent = err ? (err.length ? `Verificare: ${err.length} diferențe` : "Verificare: identic ✓") : "Verificare";
+  $("roworder").value = st.S1_ROW_ORDER.join(",");
+
+  // Sarcina 2
+  $("palette").innerHTML = Object.keys(s.colors_hex).map(c =>
+    `<button style="background:${hex(c)};color:${fg(c)}" onclick="setVal({S2_ORDER: state.settings.S2_ORDER.concat(['${c}'])})">+ ${c}</button>`).join("") +
+    `<button onclick="setVal({S2_ORDER: state.settings.S2_ORDER.slice(0, -1)})">⌫</button>`;
+  $("order").innerHTML = "<span class='muted'>jos →</span> " + st.S2_ORDER.map((c, i) =>
+    `<span class="chip" style="background:${hex(c)};color:${fg(c)}">${i + 1}. ${c}<button onclick="removeAt(${i})">×</button></span>`).join("") + " <span class='muted'>→ sus</span>";
+  drawGrid($("target"), v.stable, {
+    label: (r, c, x) => `${r + 1}${c + 1}` === st.S2_TARGET ? "TURN" : (x || "–"),
+    err: [[+st.S2_TARGET[0], +st.S2_TARGET[1]]],
+    click: (r, c) => setVal({S2_TARGET: `${r + 1}${c + 1}`})});
+  const p2 = s.plan2;
+  $("plan2").innerHTML = !p2 ? "" : p2.error ? `<span style="color:var(--danger)">${p2.error}</span>` :
+    "<ol style='margin:0;padding-left:18px'>" + p2.moves.map(([a, b, l, sl]) =>
+      `<li>${a}${sl > 1 ? " (sus)" : ""} → ${b}${b === "S" + st.S2_TARGET ? " (nivel " + l + ")" : " (eliberează" + (l > 1 ? ", peste alt cub" : "") + ")"}</li>`).join("") + "</ol>";
+
+  // Rulare
+  const running = t.status === "rulează" || t.status === "pauză";
+  $("run").disabled = running; $("stop").disabled = !running; $("cont").disabled = t.status !== "pauză";
+  $("run").textContent = "Rulează " + (s.mode === "task1" ? "Sarcina 1" : "Sarcina 2");
+  $("pause").checked = st.PAUSE_BETWEEN_PHASES;
+  $("pausebox").innerHTML = t.pause ? `<div class="pause">⏸ ${t.pause}</div>` : "";
+  $("posinfo").textContent = s.positions_missing.length ?
+    `Poziții braț necalibrate: ${s.positions_missing.length} (rulează calibrate_arm.py pe Pi)` : "Toate pozițiile brațului sunt calibrate.";
+
+  // Braț: simulare + controller
+  const arm = s.arm || {}, pad = arm.pad || {};
+  const busy = t.status === "rulează" || t.status === "pauză";
+  $("aim").disabled = busy; $("estop").disabled = !busy;
+  $("b-pad").textContent = "controller: " + (pad.status || "–");
+  $("b-pad").className = "badge " + (/OPRIT/.test(pad.status) ? "bad" : /automat|manual/.test(pad.status) ? "ok" : "warn");
+  $("b-pad").title = (pad.name || "") + (pad.stops ? ` · opriri din controller: ${pad.stops}` : "");
+  drawGrid($("mem2"), s.memorized);
+  const nt = t.notice;
+  $("notice").innerHTML = nt ? `<div class="pause">🔔 ${nt.text}</div>` : "";
+  if (nt && nt.id !== noticeId) { if (noticeId !== null) toast(nt.text); noticeId = nt.id; }
+  if (!nt && noticeId === null) noticeId = 0;
+  const key = JSON.stringify(arm.angles);
+  if (key !== armKey) {
+    armKey = key;
+    if (arm.angles) drawArm(arm.angles, arm.angles[5]);
+    $("arminfo").textContent = arm.angles ? "servo 1–6: " + arm.angles.map(Math.round).join(" · ") + "  (ultimele unghiuri trimise; desen aproximativ)"
+      : "Brațul nu a primit încă nicio comandă de la pagină.";
+  }
+
+  // Jurnal
+  const log = $("log"), atEnd = log.scrollTop + log.clientHeight >= log.scrollHeight - 5;
+  const txt = t.logs.join("\n");
+  if (log.textContent !== txt) { log.textContent = txt; if (atEnd) log.scrollTop = log.scrollHeight; }
+
+  // Setări
+  const masks = ["toate", "grila"].concat(Object.keys(s.colors_hex));
+  if ($("mask").options.length !== masks.length) $("mask").innerHTML = masks.map(m => `<option>${m}</option>`).join("");
+  $("mask").value = s.view.mask; $("rejected").checked = s.view.rejected;
+  $("cornerinfo").textContent = "Colțuri salvate pentru: " + (s.saved_corners.join(", ") || "niciun caroiaj") +
+    ` · caroiajul curent: ${v.grid}`;
+  $("synthbox").style.display = s.source === "synth" ? "" : "none";
+  if (s.source === "synth" && synthLayout) {
+    const cycle = [null].concat(Object.keys(s.colors_hex));
+    drawGrid($("synth"), synthLayout, {click: (r, c) => {
+      synthLayout[r][c] = cycle[(cycle.indexOf(synthLayout[r][c]) + 1) % cycle.length]; render(); }});
+  }
+}
+// Vederile de depanare se transmit (și se calculează pe Pi) doar cât sunt deschise.
+$("more").addEventListener("toggle", () => {
+  const open = $("more").open;
+  $("img-top").src = open ? "/stream/top" : "";
+  $("img-mask").src = open ? "/stream/mask" : "";
+});
+// Simularea brațului: desen 2D din ultimele unghiuri trimise (lateral + de sus). Lungimile sunt aproximative (mm).
+// Convenție: 90° = drept în sus pentru servo 2–4; sub 90 se apleacă în față. Dacă desenul e în oglindă, ARM.dir = -1.
+const ARM = {base: 65, l: [83, 83, 105], dir: 1};
+let armKey = "", noticeId = null;
+function drawArm(a, grip) {
+  const cv = $("armcv"), g = cv.getContext("2d"), css = getComputedStyle(document.body);
+  const ink = css.getPropertyValue("--ink"), mut = css.getPropertyValue("--muted"), dk = css.getPropertyValue("--blue-dk");
+  g.clearRect(0, 0, cv.width, cv.height);
+  g.lineCap = "round"; g.font = "11px " + css.getPropertyValue("--mono");
+  // lateral
+  const k = 0.55, ox = 90, oy = 170;
+  g.fillStyle = mut; g.fillText("lateral", 6, 14);
+  g.strokeStyle = dk; g.lineWidth = 2; g.beginPath(); g.moveTo(4, oy); g.lineTo(256, oy); g.stroke();
+  g.fillStyle = ink; g.fillRect(ox - 14, oy - 10, 28, 10);
+  let x = 0, y = ARM.base, phi = 0;
+  const pts = [[0, 0], [0, ARM.base]];
+  for (let i = 0; i < 3; i++) {
+    phi += (90 - a[i + 1]) * Math.PI / 180;
+    x += ARM.dir * ARM.l[i] * Math.sin(phi); y += ARM.l[i] * Math.cos(phi);
+    pts.push([x, y]);
+  }
+  const P = ([px, py]) => [ox + px * k, oy - py * k];
+  g.strokeStyle = ink; g.lineWidth = 6; g.beginPath(); g.moveTo(...P(pts[0]));
+  pts.slice(1).forEach(p => g.lineTo(...P(p))); g.stroke();
+  g.fillStyle = css.getPropertyValue("--butter-dk");
+  pts.slice(1, 4).forEach(p => { g.beginPath(); g.arc(...P(p), 4, 0, 7); g.fill(); });
+  // camera: privește în lungul ultimului segment
+  const [tx, ty] = P(pts[4]), dx = ARM.dir * Math.sin(phi), dy = -Math.cos(phi);
+  g.strokeStyle = css.getPropertyValue("--pink-dk"); g.lineWidth = 1; g.setLineDash([4, 3]);
+  [-0.35, 0.35].forEach(s => { g.beginPath(); g.moveTo(tx, ty);
+    g.lineTo(tx + 60 * (dx * Math.cos(s) - dy * Math.sin(s)), ty + 60 * (dx * Math.sin(s) + dy * Math.cos(s))); g.stroke(); });
+  g.setLineDash([]);
+  // gripperul: deschiderea după servo 6
+  const open = Math.max(0, Math.min(1, (135 - grip) / 75)), nx = -dy, ny = dx, w = 3 + 7 * open;
+  g.strokeStyle = ink; g.lineWidth = 3;
+  [-1, 1].forEach(s => { g.beginPath(); g.moveTo(tx + s * w * nx, ty + s * w * ny); g.lineTo(tx + s * w * nx + 10 * dx, ty + s * w * ny + 10 * dy); g.stroke(); });
+  // de sus: baza, 90° = înainte (în sus pe desen)
+  const cx = 340, cy = 105, reach = Math.abs(x) * 0.45 + 8, th = a[0] * Math.PI / 180;
+  g.fillStyle = mut; g.fillText("de sus", 266, 14);
+  g.strokeStyle = dk; g.lineWidth = 1; g.beginPath(); g.arc(cx, cy, 75, Math.PI, 0); g.stroke();
+  g.beginPath(); g.moveTo(cx - 75, cy); g.lineTo(cx + 75, cy); g.stroke();
+  g.fillStyle = ink; g.beginPath(); g.arc(cx, cy, 9, 0, 7); g.fill();
+  g.strokeStyle = ink; g.lineWidth = 6; g.beginPath(); g.moveTo(cx, cy);
+  g.lineTo(cx + reach * Math.cos(th), cy - reach * Math.sin(th)); g.stroke();
+  g.fillStyle = mut; g.fillText("0°", cx + 62, cy + 14); g.fillText("180°", cx - 82, cy + 14); g.fillText("90°", cx - 8, cy - 80);
+}
+function removeAt(i) { const o = state.settings.S2_ORDER.slice(); o.splice(i, 1); setVal({S2_ORDER: o}); }
+
+async function refresh() {
+  try {
+    state = await (await fetch("/api/state")).json();
+    render();
+  } catch (e) { $("b-task").textContent = "fără legătură cu robotul"; $("b-task").className = "badge bad"; }
+}
+refresh().then(loadSettings);
+setInterval(refresh, 500);
+</script>
+</body>
+</html>
