@@ -128,8 +128,9 @@
   <select id="src" title="sursa imaginii" onchange="post('camera', {source: this.value})">
     <option value="camera:0">Camera 0</option><option value="camera:1">Camera 1</option>
     <option value="camera:2">Camera 2</option><option value="camera:3">Camera 3</option>
+    <option value="browser" title="camera laptopului pe care e deschisă pagina; merge doar cu pagina deschisă pe https (portul 8443)">Camera laptopului (browser)</option>
     <option value="synth">Scenă simulată</option>
-    <option value="synth-arm" title="camera de pe brațul simulat: mută brațul (controller, Pasul 1 + 2) și vezi ce vede">Braț simulat (cameră pe gripper)</option>
+    <option value="synth-arm" title="camera de pe brațul simulat: mută brațul (controller, Pașii 1–3) și vezi ce vede">Braț simulat (cameră pe gripper)</option>
   </select>
   <span class="badge" id="b-src"></span>
   <span class="badge" id="b-arm"></span>
@@ -254,7 +255,7 @@
       <div class="tbar"><h2>Braț</h2><span class="spacer"></span><span class="badge" id="b-pad"></span></div>
       <div class="wbody">
         <div class="row">
-          <button class="primary" id="aim" onclick="post('aim')" title="privește în față și mișcă umărul / cotul / încheietura până vede caroiajul cu cuburi; salvează unghiurile (LOOK_S / LOOK_D) și memorează cuburile">Pasul 1: găsește caroiajul</button>
+          <button class="primary" id="aim" onclick="post('aim')" title="1: găsește caroiajul cu cuburi și le memorează; 2: așteaptă să fie luate de pe caroiaj; 3: le caută în jur, le ia una câte una, le pune înapoi și verifică">Pașii 1–3: memorează, caută, pune la loc</button>
           <button class="danger" id="estop" onclick="post('stop')">STOP</button>
           <span class="muted">sau orice buton de pe controller</span>
         </div>
@@ -296,7 +297,8 @@
           <h3>Scena sintetică (fără cameră)</h3>
           <div class="muted">Click pe o celulă schimbă culoarea. „Aplică” pune cuburile pe S și golește D.</div>
           <div class="g3 pick" id="synth"></div>
-          <div class="row"><button onclick="post('synth', {layout: synthLayout})">Aplică scena</button></div>
+          <div class="row"><button onclick="post('synth', {layout: synthLayout})">Aplică scena</button>
+            <button onclick="post('scatter')" title="brațul simulat: cuburile de pe S sunt mutate într-un loc la întâmplare (împrăștiate sau lipite), ca la Pasul 2">Mută cuburile în unghiul mort</button></div>
         </div>
       </div>
     </div>
@@ -465,6 +467,7 @@ function render() {
   const v = s.vision, t = s.task, st = s.settings;
   if (![...$("src").options].some(o => o.value === s.source)) $("src").add(new Option(s.source, s.source));
   if (document.activeElement !== $("src")) $("src").value = s.source;
+  browserCam(s.source === "browser");
   $("b-src").textContent = s.camera_error ? "imagine: " + s.camera_error : "imagine OK";
   $("b-src").className = "badge " + (s.camera_error ? "bad" : "ok");
   $("b-arm").textContent = "braț: " + (s.sim ? "simulat" : "REAL"); $("b-arm").className = "badge " + (s.sim ? "warn" : "ok");
@@ -636,6 +639,39 @@ function drawArm(a, grip) {
   g.fillStyle = mut; g.fillText("0°", cx + 62, cy + 14); g.fillText("180°", cx - 82, cy + 14); g.fillText("90°", cx - 8, cy - 80);
 }
 function removeAt(i) { const o = state.settings.S2_ORDER.slice(); o.splice(i, 1); setVal({S2_ORDER: o}); }
+
+// Sursa "browser": pagina citește camera laptopului și trimite cadrele (JPEG) la server, unul câte unul.
+// Browserul dă camera doar unei pagini sigure: https (serverul o pornește pe WEB_HTTPS_PORT) sau localhost.
+let bcam = null;
+async function browserCam(on) {
+  if (!on) {
+    if (bcam) { bcam.stream && bcam.stream.getTracks().forEach(t => t.stop()); bcam = null; }
+    return;
+  }
+  if (bcam) return;
+  bcam = {};
+  const me = bcam;
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia)
+    return toast("Browserul dă camera doar pe https: deschide https://" + location.hostname + ":" +
+                 state.https_port + " (prima dată: Advanced → Proceed)", true);
+  try {
+    me.stream = await navigator.mediaDevices.getUserMedia({video: {width: {ideal: 640}, height: {ideal: 480}}});
+  } catch (e) { return toast("Camera laptopului: " + e.message, true); }
+  if (bcam !== me) return me.stream.getTracks().forEach(t => t.stop());
+  const v = document.createElement("video");
+  v.muted = true; v.playsInline = true; v.srcObject = me.stream; await v.play();
+  const cv = document.createElement("canvas"); cv.width = 640; cv.height = 480;
+  const g = cv.getContext("2d");
+  while (bcam === me) {
+    const t0 = performance.now();
+    // decupat pe centru la 4:3 (camerele de laptop sunt de obicei 16:9)
+    const vw = v.videoWidth, vh = v.videoHeight, w = Math.min(vw, vh * 4 / 3), h = w * 3 / 4;
+    g.drawImage(v, (vw - w) / 2, (vh - h) / 2, w, h, 0, 0, cv.width, cv.height);
+    const blob = await new Promise(r => cv.toBlob(r, "image/jpeg", 0.9));
+    await fetch("/push.jpg", {method: "POST", body: blob}).catch(() => {});
+    await new Promise(r => setTimeout(r, Math.max(0, 66 - (performance.now() - t0))));
+  }
+}
 
 async function refresh() {
   try {

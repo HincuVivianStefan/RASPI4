@@ -386,6 +386,38 @@ class TestArmCamera(unittest.TestCase):
             aim.JACOBIAN_FILE = old
 
 
+class TestFetch(unittest.TestCase):
+    """Sarcina 1 cu unghiul mort: cuburile mutate în jurul brațului sunt găsite, luate și puse la loc."""
+    LAYOUT = [["rosu", None, "verde"], [None, "galben", None], ["albastru", None, "rosu"]]
+    LOOK = [90, 112, 15, 1, 90]
+
+    def setUp(self):
+        self.focal, C.CAM_FOCAL = C.CAM_FOCAL, sim_world.FOCAL
+
+    def tearDown(self):
+        C.CAM_FOCAL = self.focal
+        WORLD.reset()
+
+    def test_ik_round_trip(self):
+        from dofbot import kinematics
+        for p in ([0.15, 0, 0.015], [0.2, 0.08, 0.015], [0.12, -0.05, 0.015]):
+            down, up, _ = kinematics.reach(p, 0.05)
+            np.testing.assert_allclose(kinematics.grip(down)[0], p, atol=1e-6)
+
+    def test_restore_scattered_and_packed(self):
+        from dofbot import fetch
+        for seed, packed in ((3, False), (11, True), (14, False), (15, True)):
+            WORLD.reset(self.LAYOUT)
+            WORLD.scatter(seed=seed, packed=packed)
+            rob = Robot()
+            rob.move(self.LOOK, 200)
+            grid = fetch.grid_area(self.LOOK, sim_world.true_corners("S", self.LOOK), (640, 480))
+            f = fetch.Fetcher(rob, lambda: sim_world.arm_view(rob.last, seed=len(rob.arm.history)), lambda m: None, grid)
+            res = fetch.restore(rob, Quiet(), self.LAYOUT, self.LOOK, f)
+            self.assertEqual(res["missing"], [], f"seed {seed}, lipite {packed}")
+            self.assertEqual([[t for t, _ in row] for row in WORLD.snapshot("S")], self.LAYOUT)
+
+
 class TestMotion(unittest.TestCase):
     """Mișcarea lină a lui Robot.move, văzută prin comenzile primite de brațul simulat."""
 

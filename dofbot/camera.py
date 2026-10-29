@@ -1,7 +1,8 @@
 """Camera citită continuu într-un fir separat, ca pagina web și sarcinile să o folosească în același timp.
 
 Surse: "camera:0" (sau alt index), "synth" (scena desenată + lumea simulată), "image:poza.jpg",
-"synth-arm" (ce vede camera de pe brațul simulat, din ultimele unghiuri trimise: căutare / centrare fără braț).
+"synth-arm" (ce vede camera de pe brațul simulat, din ultimele unghiuri trimise: căutare / centrare fără braț),
+"browser" (camera laptopului: pagina o citește și trimite cadrele cu push()).
 Dacă sursa nu merge, se trimit cadre cu mesajul de eroare și se reîncearcă singur.
 """
 import threading
@@ -14,6 +15,8 @@ from . import config as C
 
 shared = None   # camera pornită de web.py; vision.grab() o folosește dacă există
 RETRY_S = 3     # după cât timp se reîncearcă o cameră care nu merge
+NO_BROWSER = (f"Nicio imagine din browser: deschide pagina pe https (portul {C.WEB_HTTPS_PORT}) "
+              "și permite camera")
 
 
 def default_source():
@@ -41,6 +44,7 @@ class Camera:
         self.seq = 0
         self.error = None
         self.cap = None       # cv2.VideoCapture deschis (doar pentru o cameră adevărată)
+        self.pushed, self.pseq = None, 0   # ultimul cadru trimis de pagină (sursa "browser")
         self._stop = threading.Event()
         self._thread = None
 
@@ -77,6 +81,16 @@ class Camera:
             if img is None:
                 raise RuntimeError(f"Nu pot citi imaginea {source[6:]}")
             return lambda: img.copy(), None
+        if source == "browser":
+            seen = [self.pseq]
+
+            def read():
+                with self.cond:
+                    if not self.cond.wait_for(lambda: self.pseq != seen[0], 0.1):
+                        return None
+                    seen[0] = self.pseq
+                    return self.pushed
+            return read, None
         if source.startswith("camera:"):
             from . import vision
             cap = vision.open_camera(int(source[7:]))
@@ -97,7 +111,7 @@ class Camera:
                 self._publish(error_frame(self.error))
                 stop.wait(RETRY_S)
                 continue
-            self.error, fails = None, 0
+            fails = 0
             live = cap is not None
             self.cap = cap
             while not stop.is_set():
@@ -105,13 +119,16 @@ class Camera:
                 f = read()
                 if f is None:
                     fails += 1
-                    if fails > 30:
+                    if fails > 30 and source == "browser":   # așteaptă pagina mai departe, fără redeschidere
+                        self.error, fails = NO_BROWSER, 0
+                        self._publish(error_frame(self.error))
+                    elif fails > 30:
                         self.error = "Camera nu mai întoarce imagini (deconectată?)"
                         self._publish(error_frame(self.error))
                         break
                     time.sleep(0.05)
                     continue
-                fails = 0
+                self.error, fails = None, 0
                 self._publish(f)
                 if not live:    # poză / scenă simulată: ritmul fluxului
                     stop.wait(max(0.0, 1 / C.STREAM_FPS - (time.time() - t0)))
@@ -119,6 +136,14 @@ class Camera:
             if cap is not None:
                 cap.release()
             stop.wait(RETRY_S if self.error else 0)
+
+    def push(self, frame):
+        """Cadru de la pagină (sursa "browser"), adus la CAM_W x CAM_H."""
+        if frame.shape[1] != C.CAM_W or frame.shape[0] != C.CAM_H:
+            frame = cv2.resize(frame, (C.CAM_W, C.CAM_H), interpolation=cv2.INTER_AREA)
+        with self.cond:
+            self.pushed, self.pseq = frame, self.pseq + 1
+            self.cond.notify_all()
 
     def controls(self):
         """Reaplică setările CAM_* pe camera deschisă. Întoarce ce nu a mers, sau None dacă nu e o cameră."""

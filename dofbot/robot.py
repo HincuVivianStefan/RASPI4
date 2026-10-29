@@ -3,6 +3,7 @@ import math
 import time
 
 from . import config as C
+from . import kinematics
 from .arm_driver import get_arm
 from .sim_world import WORLD
 
@@ -182,6 +183,26 @@ class Robot:
         if self.sim and WORLD.pick(cell) is None:
             print(f"  [SIM] atenție: nu era niciun cub de luat în {cell}")
         self.goto(f"{cell}_sus", C.T_DESCEND)
+
+    def grab_at(self, above, down):
+        """Ia un cub de oriunde de pe masă (nu dintr-o celulă): above / down = unghiurile calculate de fetch.py.
+        Întoarce True dacă cubul e în gripper."""
+        self.gripper(C.GRIP_OPEN)
+        self.move(above)
+        self.move(down, C.T_DESCEND)
+        self.gripper(C.GRIP_CLOSE)
+        if self.sim:
+            WORLD.pick_at(*kinematics.grip(down))
+        held = self.holding()
+        self.move(above, C.T_DESCEND)
+        return held
+
+    def holding(self):
+        """E un cub în gripper? Pe brațul real: servo 6 s-a oprit înainte de GRIP_CLOSE (cubul îl ține)."""
+        if self.sim:
+            return WORLD.held is not None
+        a = self.arm.Arm_serial_servo_read(6)
+        return a is None or a < C.GRIP_CLOSE - C.FETCH_EMPTY_TOL
 
     def place(self, cell, level=1):
         self.goto(f"{cell}_sus")

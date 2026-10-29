@@ -21,6 +21,7 @@ Pe Windows, dacă ceva nu merge (de exemplu camera): închide `start.bat` și d�
 
 Pe laptop, brațul e **simulat** automat, pentru că acolo nu există `Arm_Lib`. Pe Pi se folosește brațul real.
 Sursa imaginii se alege din pagină: **Camera 0–3** sau **Scenă simulată**, adică un caroiaj desenat pe care brațul simulat chiar mută cuburile. Așa poți testa ambele sarcini cap-coadă fără braț și fără cameră.
+Sursa **Camera laptopului (browser)**: pagina deschisă pe laptop trimite la Pi imaginea camerei laptopului. Browserul dă camera doar unei pagini https, așa că pentru ea deschide `https://<ip-ul-pi>:8443`. Certificatul e făcut de program (`data/https_*.pem`), deci prima dată Chrome spune „not private”: **Advanced → Proceed**, apoi „Permite” la cameră.
 
 Prima instalare:
 

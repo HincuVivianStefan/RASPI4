@@ -69,6 +69,11 @@ TEST_IMAGE = os.environ.get("DOFBOT_IMAGE")
 
 # Pagina web (python3 web.py)
 WEB_PORT = int(os.environ.get("DOFBOT_PORT", "8000"))
+# Aceeași pagină pe https (certificat făcut de program, în data/): browserul dă camera laptopului
+# doar unei pagini https sau de pe localhost. 0 = fără https.
+WEB_HTTPS_PORT = int(os.environ.get("DOFBOT_HTTPS_PORT", "8443"))
+CERT_FILE = os.path.join(DATA_DIR, "https_cert.pem")
+KEY_FILE = os.path.join(DATA_DIR, "https_key.pem")
 STREAM_FPS = 10       # cadre pe secundă trimise paginii (fluxul video, cu detecția desenată peste)
 DETECT_FPS = 5        # de câte ori pe secundă rulează detecția (separat de flux; Pi 4: 4-5)
 GRID_EVERY = 5        # caroiajul e verificat la fiecare cadru; colțurile lui se reajustează la fiecare al atâtelea
@@ -128,6 +133,17 @@ PAUSE_BETWEEN_PHASES = False   # True: după memorare, robotul așteaptă "Conti
 S1_ROW_ORDER = [1, 2, 3]       # în ce ordine se umplu rândurile destinației (întâi cel mai departe de braț)
 S2_TARGET = "22"               # celula turnului (linie, coloană)
 S2_ORDER = ["rosu", "galben", "verde", "albastru", "rosu"]   # de JOS în SUS
+
+# Sarcina 1, partea a doua (dofbot/fetch.py): cuburile mutate într-un loc pe care camera nu-l vedea („unghiul
+# mort”) sunt căutate, luate unul câte unul și puse înapoi în celulele memorate.          # REGLEAZĂ pe brațul real
+FETCH_CUBE_M = 0.03       # latura cubului, în metri
+GRIP_LEN = 0.115          # încheietura → punctul dintre degetele gripperului unde ajunge centrul cubului, m
+FETCH_LIFT = 0.05         # de unde privește cubul înainte să-l ia: atâția metri înapoi, de-a lungul gripperului
+FETCH_TOL = 0.004         # m: poziția cubului e bună când două priviri de aproape diferă cu mai puțin de atât
+FETCH_OFFSET = [0.0, 0.0] # m, adunat la punctul de prindere (spre cub / la stânga lui), dacă brațul greșește mereu la fel
+FETCH_ROLL_SIGN = 1       # -1 dacă servo 5 rotește gripperul invers decât crede programul (degetele nu se aliniază)
+FETCH_MIN_PITCH = 110     # cât de înclinat poate fi gripperul pentru un cub departe (180 = vertical, 90 = orizontal)
+FETCH_EMPTY_TOL = 6       # grade: gripperul închis la mai puțin de atât de GRIP_CLOSE = nu a prins nimic
 
 # Scena sintetică (DOFBOT_IMAGE=synth): culorile de pe caroiajul S la pornire / reset
 SYNTH_LAYOUT = [["galben", "verde", "albastru"],

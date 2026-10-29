@@ -11,6 +11,8 @@ Doar biblioteca standard + OpenCV/numpy. Nu are parolă: rulați-l doar în reț
 import json
 import os
 import socket
+import ssl
+import subprocess
 import sys
 import threading
 import time
@@ -23,6 +25,7 @@ import numpy as np
 
 from . import camera
 from . import aim
+from . import fetch
 from . import config as C
 from . import hat
 from . import pad
@@ -372,6 +375,7 @@ class Runner:
         self.stop_ev = threading.Event()
         self.cont_ev = threading.Event()
         self.on_memorize = lambda colors: None   # App: afișează aranjarea memorată de Pasul 1
+        self.grid_area = None                     # caroiajul pe masă (m), văzut la Pasul 1
         self.clear()
 
     def clear(self):
@@ -443,16 +447,27 @@ class Runner:
         with open(C.POS_FILE, "w", encoding="utf-8") as f:
             json.dump(rob.pos, f, indent=2)
         self.log(f"Caroiaj {grid} găsit. Unghiurile salvate ca LOOK_{grid} = {angles}")
+        seen = self.look()
+        self.grid_area = fetch.grid_area(angles, seen["corners"], seen["size"])   # cuburile de pe el nu se iau
         colors = self.detect(grid)
         self.on_memorize(colors)
         self.publish("source", colors)
         n = sum(c is not None for row in colors for c in row)
         self.log(f"Cuburi memorate:\n{tasks.grid_text(colors)}")
         self.notify(f"Am găsit caroiajul cu cuburi și l-am memorat: {n} cuburi.", ["Caroiaj gasit!", "Memorat: %d cuburi" % n])
-        return {"grid": grid, "angles": angles, "colors": colors}   # Pasul 2 (self.step2) vine după
+        return {"grid": grid, "angles": angles, "colors": colors}
+
+    def steps(self, rob):
+        """Sarcina 1 cu unghiul mort: Pasul 1 (memorează), Pasul 2 (așteaptă caroiajul gol), Pasul 3 (caută cuburile,
+        le pune la loc și verifică)."""
+        if rob.sim and self.pipeline.cam.source != "synth-arm":
+            raise RuntimeError("Cu brațul simulat, alege sursa „Braț simulat (cameră pe gripper)”")
+        first = self.step1(rob)
+        self.step2(rob, first["grid"], first["angles"], first["colors"])
+        return self.step3(rob, first["grid"], first["angles"], first["colors"])
 
     def step2(self, rob, grid, look, memorized):
-        """Pasul 2: așteaptă să dispară toate cuburile de pe caroiaj, apoi se uită stânga / dreapta după ele."""
+        """Pasul 2: așteaptă să dispară toate cuburile de pe caroiaj."""
         left, empty_votes = None, 0
         while empty_votes < 2:      # de două ori la rând gol (fiecare = vot pe STABLE_FRAMES cadre)
             rob.check()
@@ -468,39 +483,24 @@ class Runner:
             left = n
         self.notify("Caroiajul e gol. Caut cuburile stânga / dreapta.", ["Caroiaj gol", "Caut cuburile"])
 
-        found = {}
-        bases = [b for b in range(round(look[0]) - 75, round(look[0]) + 76, 15) if 0 <= b <= 180]
-        for k, b in enumerate(bases):
-            pose = list(look)
-            pose[0] = b
-            rob.move(pose, 1500 if k == 0 else 600)
-            rob.sleep(aim.SETTLE_S)
-            best = []
-            for _ in range(2):      # două cadre; îl păstrăm pe cel cu mai multe cuburi
-                try:
-                    cubes, _ = vision.find_cubes(self.frame())
-                except RuntimeError:
-                    continue
-                if len(cubes) > len(best):
-                    best = cubes
-            if best:
-                found[b] = sorted(o["color"] for o in best)
-                self.log(f"  baza {b}°: {', '.join(found[b])}")
+    def step3(self, rob, grid, look, memorized):
+        """Pasul 3: caută cuburile în jur, le pune înapoi în celulele memorate, apoi verifică caroiajul."""
+        fetcher = fetch.Fetcher(rob, self.frame, self.log, self.grid_area)
+        report = fetch.restore(rob, self, memorized, look, fetcher, grid)
         rob.move(look, 1500)
-        self.publish("found", found)
-        # Același cub se vede din mai multe unghiuri vecine: pentru fiecare culoare, cele mai multe dintr-o privire.
-        counts = {}
-        for colors in found.values():
-            for c in set(colors):
-                counts[c] = max(counts.get(c, 0), colors.count(c))
-        total = sum(counts.values())
-        want = [c for row in memorized for c in row if c]
-        missing = {c: want.count(c) - counts.get(c, 0) for c in set(want) if want.count(c) > counts.get(c, 0)}
-        self.publish("found_counts", counts)
-        self.notify(f"Am găsit cam {total} cuburi ({', '.join(f'{c} {n}' for c, n in sorted(counts.items())) or 'niciunul'}); "
-                    f"memorate {len(want)}" + (f"; lipsesc: {missing}" if missing else "."),
-                    [f"Gasite: ~{total} cuburi", f"Memorate: {len(want)}"])
-        return {"grid": grid, "angles": look, "colors": memorized, "found": found}
+        colors = self.detect(grid)
+        self.publish("dest", colors)
+        errors = planner.compare(memorized, colors)
+        left = [color for _, color in report["missing"]]
+        self.log(f"Caroiajul acum:\n{tasks.grid_text(colors)}")
+        if errors or left:
+            self.notify(f"Am pus {len(report['placed'])} cuburi; " + (f"lipsesc: {', '.join(left)}; " if left else "")
+                        + (f"diferențe la {errors}" if errors else "restul e la locul lui"),
+                        [f"Puse: {len(report['placed'])}", f"Lipsa: {len(left)} Gresite: {len(errors)}"])
+        else:
+            self.notify(f"Gata: toate cele {len(report['placed'])} cuburi sunt la locul lor.",
+                        ["Gata!", f"{len(report['placed'])} cuburi la loc"])
+        return {"grid": grid, "angles": look, "colors": memorized, "dest": colors, "errors": errors, **report}
 
     def look(self, timeout=3.0):
         """Ce vede detecția paginii pe un cadru procesat după acest moment (aceeași urmărire ca în pagină)."""
@@ -558,7 +558,7 @@ class Runner:
         try:
             rob = Robot(should_stop=self.stop_ev.is_set, on_look=self.pipeline.set_grid)
             self.log(f"Pornesc {task} (braț {'simulat' if rob.sim else 'REAL'})")
-            fn = {"task1": tasks.run_task1, "task2": tasks.run_task2, "aim": lambda r, ctx: ctx.step1(r)}[task]
+            fn = {"task1": tasks.run_task1, "task2": tasks.run_task2, "aim": lambda r, ctx: ctx.steps(r)}[task]
             self.result = fn(rob, self)
             self.status = "gata"
         except Stopped:
@@ -625,6 +625,7 @@ class App:
         p = self.pipeline.state
         s = {
             "mode": self.mode, "sim": self.sim, "source": self.cam.source, "camera_error": self.cam.error,
+            "https_port": C.WEB_HTTPS_PORT,
             "vision": p, "view": self.pipeline.view, "settings": C.settings(),
             "colors_hex": {k: overlay.HEX.get(k, "#c060c0") for k in C.COLORS},
             "memorized": self.memorized, "verify": self.verify,
@@ -803,12 +804,18 @@ class App:
 
     def a_camera(self, b):
         src = str(b.get("source", ""))
-        if not (src in ("synth", "synth-arm") or (src.startswith("camera:") and src[7:].isdigit())):
+        if not (src in ("synth", "synth-arm", "browser") or (src.startswith("camera:") and src[7:].isdigit())):
             raise ValueError("Sursă invalidă")
         self.cam.switch(src)
         self.pipeline.reset()
         vision.forget()     # altă cameră: altă focală
         return self.say(f"Sursa imaginii: {src}")
+
+    def a_scatter(self, b):
+        if not self.sim:
+            raise ValueError("Doar cu brațul simulat")
+        packed = WORLD.scatter(packed=b.get("packed"))
+        return self.say("Cuburile de pe S sunt acum într-un unghi mort" + (" (lipite)" if packed else ""))
 
     def a_synth(self, b):
         C.apply_settings({"SYNTH_LAYOUT": b["layout"]})
@@ -920,6 +927,8 @@ class Handler(BaseHTTPRequestHandler):
                 p.viewers[kind] -= 1
 
     def do_POST(self):
+        if self.path == "/push.jpg":
+            return self.push()
         name = self.path.split("?")[0].removeprefix("/api/").replace("/", "_")
         fn = getattr(APP, "a_" + name, None)
         if fn is None:
@@ -931,6 +940,18 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, KeyError, TypeError, RuntimeError) as e:
             self.send(400, {"ok": False, "error": str(e)})
 
+    def push(self):
+        """Un cadru JPEG de la camera laptopului (sursa "browser")."""
+        n = int(self.headers.get("Content-Length") or 0)
+        data = np.frombuffer(self.rfile.read(n), np.uint8)
+        if APP.cam.source != "browser":
+            return self.send(409, {"error": "Sursa imaginii nu e camera din browser"})
+        frame = cv2.imdecode(data, cv2.IMREAD_COLOR) if n else None
+        if frame is None:
+            return self.send(400, {"error": "JPEG invalid"})
+        APP.cam.push(frame)
+        self.send(200, {"ok": True})
+
 
 def local_ip():
     """IP-ul laptopului în rețeaua locală (fără să trimită nimic: doar alege interfața spre o adresă)."""
@@ -940,6 +961,30 @@ def local_ip():
             return sock.getsockname()[0]
     except OSError:
         return None
+
+
+def https_server(ip):
+    """Serverul https (pentru camera laptopului din browser), sau None + motivul dacă nu se poate.
+    Certificatul e făcut o dată, cu openssl; browserul îl arată ca „nesigur” până îl accepți."""
+    if not C.WEB_HTTPS_PORT:
+        return None, "https oprit (DOFBOT_HTTPS_PORT=0)"
+    try:
+        if not (os.path.exists(C.CERT_FILE) and os.path.exists(C.KEY_FILE)):
+            os.makedirs(C.DATA_DIR, exist_ok=True)
+            san = "DNS:localhost,IP:127.0.0.1" + (f",IP:{ip}" if ip else "")
+            subprocess.run(["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
+                            "-nodes", "-days", "3650", "-subj", "/CN=dofbot", "-addext", f"subjectAltName={san}",
+                            "-keyout", C.KEY_FILE, "-out", C.CERT_FILE],
+                           check=True, capture_output=True, timeout=30)
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(C.CERT_FILE, C.KEY_FILE)
+        server = ThreadingHTTPServer(("0.0.0.0", C.WEB_HTTPS_PORT), Handler)
+    except (OSError, subprocess.SubprocessError, ssl.SSLError) as e:
+        return None, f"fără https: {e}"
+    server.daemon_threads = True
+    # Handshake-ul TLS se face în firul cererii, nu în cel care acceptă conexiunile.
+    server.socket = ctx.wrap_socket(server.socket, server_side=True, do_handshake_on_connect=False)
+    return server, None
 
 
 def main():
@@ -959,6 +1004,13 @@ def main():
     APP = App()
     ip = local_ip()
     print(f"Pagina: {url}" + (f"  (de pe telefon / alt laptop din aceeași rețea: http://{ip}:{C.WEB_PORT})" if ip else ""))
+    hs, why = https_server(ip)
+    if hs:
+        threading.Thread(target=hs.serve_forever, daemon=True, name="https").start()
+        print(f"Camera laptopului: https://{ip or 'localhost'}:{C.WEB_HTTPS_PORT}  (prima dată: „Advanced” → "
+              f"„Proceed”, apoi sursa „Camera laptopului (browser)”)")
+    else:
+        print(why)
     if os.name == "nt":
         print("Dacă Windows întreabă de firewall: „Allow” / „Permite”, ca pagina să se vadă și din rețea.")
     print(f"Camera: {APP.cam.source} | braț: {'simulat' if APP.sim else 'real'}")

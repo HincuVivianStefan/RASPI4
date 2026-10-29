@@ -97,10 +97,11 @@ def render(cells, size=(640, 480), seed=0, noise=6.0, jitter=6, yaw=0.0, lines=T
 
 
 def render_scenes(scenes, size=(640, 480), seed=0, noise=6.0, jitter=6, yaw=0.0, lines=True, paper=True,
-                  light=1.0, cast=(1.0, 1.0, 1.0)):
+                  light=1.0, cast=(1.0, 1.0, 1.0), loose=None):
     """Ca render, dar cu oricâte caroiaje, fiecare cu camera lui: scenes = [(cells, P, eye)], unde P (3x4)
     proiectează coordonatele caroiajului (în celule) în imagine, iar eye = poziția camerei în aceleași coordonate.
-    Un caroiaj aflat (și parțial) în spatele camerei nu se desenează."""
+    Un caroiaj aflat (și parțial) în spatele camerei nu se desenează.
+    loose = (P, eye, [(x, y, culoare, yaw)]): cuburi puse oriunde pe masă, în coordonatele lui P."""
     rng = np.random.default_rng(seed)
     sheet = np.full((PAPER, PAPER, 3), 235, np.uint8)
     o = (PAPER - GRID) // 2
@@ -132,6 +133,14 @@ def render_scenes(scenes, size=(640, 480), seed=0, noise=6.0, jitter=6, yaw=0.0,
         # Întâi cele mai depărtate de cameră, ca cele din față să le acopere.
         for x, y, color, height, face, turn in sorted(cubes, key=lambda q: -np.hypot(q[0] - eye[0], q[1] - eye[1])):
             _draw_cube(img, P, x, y, color, height, face, turn, eye)
+    if loose:
+        P, eye, cubes = loose
+        far = sorted(cubes, key=lambda q: -np.hypot(q[0] - eye[0], q[1] - eye[1]))
+        for x, y, color, turn in far:
+            # doar cuburile din fața camerei (cu toate colțurile)
+            pts = np.array([[x + dx, y + dy, dz, 1] for dx in (-1, 1) for dy in (-1, 1) for dz in (0, SIDE)]) @ P.T
+            if pts[:, 2].min() > 1e-3:
+                _draw_cube(img, P, x, y, color, 1, "sus", turn, eye)
 
     # Lumină neuniformă + zgomot de senzor (zgomotul e pregătit o dată; generarea lui la fiecare cadru e lentă).
     xs = np.linspace(0.85, 1.08, w, dtype=np.float32)
