@@ -23,7 +23,7 @@ MAP = {
     "open": 0, "close": 1, "save": 8, "home": 10,
     "quit": 9,                                                  # Start
 }
-LIMITS = [(0, 180), (0, 180), (0, 180), (0, 180), (0, 270)]
+LIMITS = C.LIMITS
 DEADZONE = 0.15
 SPEEDS = [20, 45, 90]   # grade pe secundă la stick împins la maxim
 RAMP_S = 0.4            # în cât timp ajunge la viteza maximă / se oprește (mai mare = mai lin)
@@ -46,6 +46,8 @@ def sdl_env():
     os.environ.setdefault("SDL_VIDEODRIVER", "dummy")              # fără fereastră, merge și prin SSH
     os.environ.setdefault("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1")
     os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+    # Altfel SDL preia Ctrl+C / SIGTERM (le face evenimente pe care nu le citim) și pagina nu se mai oprește.
+    os.environ.setdefault("SDL_NO_SIGNAL_HANDLERS", "1")
 
 
 class Pad:

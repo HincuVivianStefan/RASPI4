@@ -11,6 +11,8 @@ Doar biblioteca standard + OpenCV/numpy. Nu are parolă: rulați-l doar în reț
 import json
 import os
 import socket
+import ssl
+import subprocess
 import sys
 import threading
 import time
@@ -23,10 +25,10 @@ import numpy as np
 
 from . import camera
 from . import aim
+from . import fetch
 from . import config as C
 from . import hat
 from . import pad
-from . import pick
 from . import overlay
 from . import planner
 from . import tasks
@@ -37,7 +39,9 @@ from .sim_world import WORLD
 
 STATIC = os.path.join(C.HERE, "static")
 SMOOTH = 0.5          # netezirea colțurilor găsite automat (0 = fără)
-LOST_AFTER = 4        # după câte căutări nereușite spunem că e pierdut
+LOST_AFTER = 2        # după câte cadre la rând fără caroiaj spunem că e pierdut (nu mai e desenat)
+LOST_S = 0.6          # sau după atâtea secunde fără confirmare (când procesarea e lentă)
+PARTIAL_EVERY = 3     # caroiaj pierdut, fără sarcină: căutăm unul parțial (un colț) la fiecare al atâtelea cadru
 IDLE_AFTER = 3.0      # fără pagină deschisă și fără sarcină, după atâtea secunde nu mai procesăm nimic
 STREAMS = ("cam", "top", "mask")
 
@@ -112,6 +116,10 @@ class Pipeline:
             self.corners = None
             self.corner_src = None
             self.missed = LOST_AFTER
+            self.last_ok = 0.0
+            self.grid_status, self.grid_conf = "pierdut", None
+            self.partial = None   # caroiajul văzut doar parțial (colțuri extrapolate), când cel întreg lipsește
+            self.lines = None     # fără caroiaj, nici parțial: centrul liniilor negre văzute (x, y în 0..1)
             self.history = deque(maxlen=30)   # 3x3 cu (culoare, fața colorată) sau None
             self.stable_faces = None
             self.result = {"corners": None, "colors": None, "cubes": [], "rejected": []}
@@ -123,7 +131,7 @@ class Pipeline:
             self.saved_ok, self.last_small = True, None
             if grid != self.grid:
                 self.grid = grid
-                self.corners = self.last_good = None
+                self.corners = self.last_good = self.partial = None
                 self.history.clear()
 
     def save_corners(self, grid, corners):
@@ -177,6 +185,8 @@ class Pipeline:
                 if r["corners"]:
                     overlay.draw_grid(view, r["corners"], r["colors"])
                     overlay.draw_corners(view, r["corners"])
+                elif r.get("partial"):
+                    overlay.draw_partial(view, r["partial"])
                 self.publish("cam", cv2.imencode(".jpg", view, q)[1].tobytes())
                 self.stream_fps = fps
             except Exception:   # noqa: BLE001 - fluxul nu are voie să se oprească
@@ -216,7 +226,10 @@ class Pipeline:
         return dx * frame.shape[1] / 160, dy * frame.shape[0] / 120
 
     def track(self, frame):
-        """Colțurile caroiajului: automat (netezite între cadre) sau cele salvate în vision.json."""
+        """Colțurile caroiajului. Automat: cele ținute minte sunt verificate pe fiecare cadru (ieftin) și căutate
+        din nou doar când nu se mai potrivesc; după LOST_AFTER cadre / LOST_S fără confirmare caroiajul e pierdut
+        și nu mai e desenat. vision.json e doar un punct de plecare pentru căutare, nu se afișează neverificat.
+        Manual (AUTO_GRID oprit): colțurile salvate, cât timp camera nu s-a mișcat."""
         self.count += 1
         shift = self.moved(frame)
         moving = shift is not None
@@ -226,38 +239,66 @@ class Pipeline:
             move = lambda c: [[x + shift[0], y + shift[1]] for x, y in c] if c else None  # noqa: E731
             self.corners, self.last_good = move(self.corners), move(self.last_good)
         saved = self.saved.get(self.grid) if self.saved_ok else None
-        if C.AUTO_GRID and self.corner_src == "auto" and self.missed == 0 and self.count % C.GRID_EVERY and not moving:
-            return      # caroiajul e fix pe masă: nu-l căutăm la fiecare cadru
-        # Și colțurile salvate sunt un bun punct de plecare când cuburile acoperă liniile (doar până se mișcă camera).
-        prev = self.corners if self.corner_src else self.last_good or saved
-        found = vision.find_grid(frame, prev) if C.AUTO_GRID else None
-        if (found is not None and prev is None and self.grid == "S" and C.GRID_NEED_CUBES
-                and vision.cubes_inside(frame, found) < C.GRID_NEED_CUBES):
-            found = None    # găsit de la zero, dar fără cuburi: probabil o grilă de pe jos, nu caroiajul
+        if not C.AUTO_GRID:
+            self.corners, self.corner_src = (saved, "manual") if saved else (None, None)
+            self.grid_status, self.grid_conf = ("manual" if saved else "pierdut"), None
+            return
+        now = time.time()
+        if self.corners is not None and not moving:
+            conf = vision.verify_grid(frame, self.corners)
+            # None = liniile sunt aproape toate sub cuburi; cuburile stau însă tot pe el, deci e încă acolo.
+            if conf is None or conf >= vision.VERIFY_OK:
+                self.missed, self.last_ok, self.grid_conf = 0, now, conf
+                self.grid_status = "acoperit" if conf is None else "urmărit"
+                if self.count % C.GRID_EVERY == 0:      # din când în când, ajustăm colțurile pe imagine
+                    self.accept(vision.find_grid(frame, self.corners))
+                return
+        # Pierdut sau camera în mișcare: căutăm pornind de la ce știm (colțurile vechi, apoi cele salvate),
+        # apoi de la zero. Orice rezultat al lui find_grid e verificat pe imagine.
+        prev = self.corners or self.last_good or saved
+        found = vision.find_grid(frame, prev) if prev is not None else None
+        if found is None:
+            found = vision.find_grid(frame)
+            if (found is not None and self.grid == "S" and C.GRID_NEED_CUBES
+                    and vision.cubes_inside(frame, found) < C.GRID_NEED_CUBES):
+                found = None    # găsit de la zero, dar fără cuburi: probabil o grilă de pe jos, nu caroiajul
         if found is not None:
-            self.missed = 0
-            old = self.corners if self.corner_src == "auto" else None
-            if old and all(abs(a - b) < 25 for p, q in zip(found, old) for a, b in zip(p, q)):
-                found = [[SMOOTH * a + (1 - SMOOTH) * b for a, b in zip(p, q)] for p, q in zip(old, found)]
-            self.corners, self.corner_src = found, "auto"
-            self.last_good = found
-        else:
-            self.missed += 1
-            # Cu caroiajul automat pornit, păstrăm puțin ultimele colțuri găsite (o pierdere scurtă nu contează);
-            # când camera se mișcă, ele au fost deja mutate odată cu imaginea.
-            if not C.AUTO_GRID or self.corner_src != "auto" or self.missed >= LOST_AFTER:
-                self.corners, self.corner_src = (saved, "manual") if saved else (None, None)
+            self.accept(found)
+            self.missed, self.last_ok, self.grid_status, self.grid_conf = 0, now, "găsit", None
+            self.partial = self.lines = None
+            return
+        self.missed += 1
+        if self.missed >= LOST_AFTER or now - self.last_ok > LOST_S:
+            self.corners, self.corner_src = None, None
+            self.grid_status, self.grid_conf = "pierdut", None
+            # Poate se vede doar o parte (un colț): îl extrapolăm, ca centrarea să știe încotro să meargă. E mai
+            # scump, deci în afara centrării / sarcinilor doar la fiecare al PARTIAL_EVERY-lea cadru.
+            if self.urgent or self.count % PARTIAL_EVERY == 0:
+                self.partial = vision.find_partial_grid(frame)
+            self.lines = vision.lines_hint(frame) if self.partial is None else None
+            if self.partial is not None:
+                self.grid_status = "parțial"
+
+    def accept(self, found):
+        """Colțuri noi găsite automat, netezite cu cele vechi dacă sunt aproape (fără tremur pe imagine)."""
+        if found is None:
+            return
+        old = self.corners if self.corner_src == "auto" else None
+        if old and all(abs(a - b) < 25 for p, q in zip(found, old) for a, b in zip(p, q)):
+            found = [[SMOOTH * a + (1 - SMOOTH) * b for a, b in zip(p, q)] for p, q in zip(old, found)]
+        self.corners, self.corner_src, self.last_good = found, "auto", found
 
     def process(self, frame):
         t0 = time.time()
         with self.lock:
             self.track(frame)
-            corners, src = self.corners, self.corner_src
+            corners, src, partial = self.corners, self.corner_src, self.partial
         if not (self.urgent or self.count % C.CUBE_EVERY == 0):
             # Doar caroiajul (urmărește camera); cuburile rămân cele de la ultima detecție.
-            self.result = dict(self.result, corners=corners)
-            self.state = dict(self.state, corners=corners, corner_src=src, grid=self.grid,
-                              grid_found=self.missed < LOST_AFTER, frozen=self.frozen is not None,
+            self.result = dict(self.result, corners=corners, partial=partial)
+            self.state = dict(self.state, corners=corners, corner_src=src, grid=self.grid, partial=partial,
+                              grid_found=corners is not None, grid_status=self.grid_status,
+                              grid_conf=self.grid_conf, frozen=self.frozen is not None,
                               stream_fps=round(self.stream_fps, 1))
             self.done_t = time.time()
             return
@@ -270,7 +311,7 @@ class Pipeline:
                 top = vision.annotate_top(d["top"], colors, fracs, cubes, corners)
         else:
             cubes, rejected = vision.find_cubes(frame)   # și fără caroiaj arătăm ce obiecte vedem
-        self.result = {"corners": corners, "colors": colors, "cubes": cubes, "rejected": rejected}
+        self.result = {"corners": corners, "colors": colors, "cubes": cubes, "rejected": rejected, "partial": partial}
         with self.lock:
             if colors:
                 self.history.append(combine(colors, faces))
@@ -287,13 +328,15 @@ class Pipeline:
             "corners": corners,
             "cubes": [{k: o.get(k) for k in ("color", "cell", "face", "angle", "area", "aspect")} for o in cubes],
             "rejected": [{k: o[k] for k in ("color", "reason", "area", "aspect", "fill")} for o in rejected],
-            "corner_src": src, "grid": self.grid, "grid_found": self.missed < LOST_AFTER,
+            "corner_src": src, "grid": self.grid, "grid_found": corners is not None, "partial": partial,
+            "grid_status": self.grid_status, "grid_conf": self.grid_conf,
             "frozen": self.frozen is not None, "stream_fps": round(self.stream_fps, 1),
             "ms": round((time.time() - t0) * 1000), "frame_size": [frame.shape[1], frame.shape[0]],
         }
         self.done_t = time.time()
 
     def mask_image(self, frame):
+        frame = vision.normalize_light(frame)   # ce vede detecția: foaia adusă la alb
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         m = self.view["mask"]
         if m == "grila":
@@ -333,6 +376,7 @@ class Runner:
         self.cont_ev = threading.Event()
         self.on_memorize = lambda colors: None   # App: afișează aranjarea memorată de Pasul 1
         self.memory = None   # ce a memorat Pasul 1 (caroiaj, unghiuri, culori), pentru „Pune cuburile înapoi”
+        self.grid_area = None                     # caroiajul pe masă (m), văzut la Pasul 1
         self.clear()
 
     def clear(self):
@@ -404,41 +448,38 @@ class Runner:
         with open(C.POS_FILE, "w", encoding="utf-8") as f:
             json.dump(rob.pos, f, indent=2)
         self.log(f"Caroiaj {grid} găsit. Unghiurile salvate ca LOOK_{grid} = {angles}")
+        seen = self.look()
+        self.grid_area = fetch.grid_area(angles, seen["corners"], seen["size"])   # cuburile de pe el nu se iau
         colors = self.detect(grid)
         self.on_memorize(colors)
         self.publish("source", colors)
         n = sum(c is not None for row in colors for c in row)
         self.log(f"Cuburi memorate:\n{tasks.grid_text(colors)}")
         self.notify(f"Am găsit caroiajul cu cuburi și l-am memorat: {n} cuburi.", ["Caroiaj gasit!", "Memorat: %d cuburi" % n])
-        # Cât de mare e o celulă în imagine: la scanare, cuburile din jur au cam aceeași mărime.
-        corners, (w, h) = self.look()["corners"], self.look()["size"]
-        cell = cv2.contourArea(np.float32(corners)) / 9 / (w * h) if corners else None
-        return {"grid": grid, "angles": angles, "colors": colors, "cell": cell}
+        return {"grid": grid, "angles": angles, "colors": colors}
 
-    def memorize_only(self, rob):
+    def memorize(self, rob):
         """Butonul „Sarcina 1: găsește și memorează”: Pasul 1, apoi brațul așteaptă butonul „Pune cuburile înapoi”."""
-        s1 = self.step1(rob)
-        if not any(any(row) for row in s1["colors"]):
+        if rob.sim and self.pipeline.cam.source != "synth-arm":
+            raise RuntimeError("Cu brațul simulat, alege sursa „Braț simulat (cameră pe gripper)”")
+        first = self.step1(rob)
+        if not any(any(row) for row in first["colors"]):
             raise RuntimeError("Nu am memorat niciun cub")
-        self.memory = s1
-        lacking = pick.missing(rob.pos)
-        if lacking and not rob.sim:
-            self.log(f"Atenție: prinderea nu e învățată încă (lipsesc {', '.join(lacking)}).")
+        self.memory = dict(first, grid_area=self.grid_area)
         self.notify("Aranjarea e memorată. Luați cuburile (oricâte, oricând), apoi apăsați „Pune cuburile înapoi”.",
                     ["Memorat!", "Astept butonul"])
-        return s1
+        return first
 
     def rebuild(self, rob):
-        """Butonul „Pune cuburile înapoi”: se uită la caroiaj ce lipsește față de memorie, caută cuburile
-        stânga / dreapta și le pune în celulele goale, apoi verifică."""
+        """Butonul „Pune cuburile înapoi”: se uită la caroiaj ce lipsește față de memorie, caută cuburile în jur
+        și le pune în celulele goale (cele rămase pe caroiaj nu le atinge), apoi verifică."""
         if not self.memory:
             raise RuntimeError("Nu am memorat încă o aranjare: apasă întâi „Sarcina 1: găsește și memorează”")
-        lacking = pick.missing(rob.pos)
-        if lacking:
-            raise RuntimeError(f"Prinderea nu e învățată: lipsesc {', '.join(lacking)}")
-        t0 = time.time()
-        s1 = self.memory
-        grid, look, memorized = s1["grid"], s1["angles"], s1["colors"]
+        if rob.sim and self.pipeline.cam.source != "synth-arm":
+            raise RuntimeError("Cu brațul simulat, alege sursa „Braț simulat (cameră pe gripper)”")
+        m = self.memory
+        grid, look, memorized = m["grid"], m["angles"], m["colors"]
+        self.grid_area = m["grid_area"]
         self.log("Mă uit la caroiaj: ce a rămas pe el?")
         rob.move(look, 1500)
         rob.sleep(0.5)
@@ -451,53 +492,26 @@ class Runner:
         if left:
             self.log(f"Au rămas pe caroiaj: {', '.join(left)} (nu le mai pun)")
         self.notify("Caut cuburile stânga / dreapta și le pun la loc.", ["Pun cuburile", "inapoi..."])
-        picker = pick.Picker(rob, self.see, self.log, look=look, scan_ref=s1["cell"])
-        out = picker.rebuild(memorized, grid, C.S1_ROW_ORDER, present=present)
-        self.publish("rebuild", out)
+        return self.step3(rob, grid, look, memorized, present)
+
+    def step3(self, rob, grid, look, memorized, present=None):
+        """Pasul 3: caută cuburile în jur, le pune înapoi în celulele memorate, apoi verifică caroiajul."""
+        fetcher = fetch.Fetcher(rob, self.frame, self.log, self.grid_area)
+        report = fetch.restore(rob, self, memorized, look, fetcher, grid, present)
         rob.move(look, 1500)
-        rob.sleep(0.5)
-        now = self.detect(grid)
-        self.publish("dest", now)
-        errors = planner.compare(memorized, now)
-        dt = time.time() - t0
-        self.notify(f"Gata în {dt:.0f} s: " + ("caroiajul e identic cu cel memorat." if not errors
-                                                else f"diferă {len(errors)} celule: {errors}"),
-                    ["Sarcina 1 gata", "OK" if not errors else f"{len(errors)} diferente"])
-        return {"grid": grid, "memorized": memorized, "dest": now, "errors": errors,
-                "missing": out["missing"], "seconds": round(dt, 1)}
-
-    def see(self, ref=None):
-        """Cuburile dintr-un cadru nou, fără caroiaj: [{color, x, y, angle}], x și y ca fracțiuni din imagine."""
-        frame = self.frame()
-        h, w = frame.shape[:2]
-        cubes, _ = vision.find_cubes(frame, ref=ref)
-        return [{"color": o["color"], "x": o["center"][0] / w, "y": o["center"][1] / h, "angle": o["angle"]}
-                for o in cubes]
-
-    def learn_pick(self, rob, which):
-        """„Învață prinderea”: cu un cub pus unde a fost învățată PICK_<which>_jos, ține minte unde se vede
-        din poziția de scanare (baza în față) și de deasupra lui (PICK_<which>_sus)."""
-        need = [f"PICK_{which}_sus", f"PICK_{which}_jos"]
-        if any(n not in rob.pos for n in need) or "LOOK_S" not in rob.pos:
-            raise RuntimeError(f"Învață întâi {', '.join(need)} (tools/calibrate_arm.py) și rulează Pasul 1 (LOOK_S)")
-        scan = list(rob.pos["LOOK_S"])
-        scan[0] = rob.pos[f"PICK_{which}_sus"][0]
-        rob.move(scan, 1500)
-        rob.sleep(pick.SETTLE_S)
-        seen = self.see()
-        if len(seen) != 1:
-            raise RuntimeError(f"Din poziția de scanare văd {len(seen)} cuburi; lasă unul singur, în locul prinderii")
-        rob.move(rob.pos[f"PICK_{which}_sus"], 1500)
-        rob.sleep(pick.SETTLE_S)
-        close = self.see(pick.HOVER_REF)
-        if len(close) != 1:
-            raise RuntimeError(f"De deasupra cubului văd {len(close)} cuburi; trebuie unul")
-        data = pick.load()
-        data[which] = {"scan_y": round(seen[0]["y"], 3), "hover": [round(close[0]["x"], 3), round(close[0]["y"], 3)],
-                       "angle": close[0]["angle"]}
-        pick.save(data)
-        self.notify(f"Prinderea {which} învățată: {data[which]}", ["Prindere invatata", which])
-        return data
+        colors = self.detect(grid)
+        self.publish("dest", colors)
+        errors = planner.compare(memorized, colors)
+        left = [color for _, color in report["missing"]]
+        self.log(f"Caroiajul acum:\n{tasks.grid_text(colors)}")
+        if errors or left:
+            self.notify(f"Am pus {len(report['placed'])} cuburi; " + (f"lipsesc: {', '.join(left)}; " if left else "")
+                        + (f"diferențe la {errors}" if errors else "restul e la locul lui"),
+                        [f"Puse: {len(report['placed'])}", f"Lipsa: {len(left)} Gresite: {len(errors)}"])
+        else:
+            self.notify(f"Gata: toate cele {len(report['placed'])} cuburi sunt la locul lor.",
+                        ["Gata!", f"{len(report['placed'])} cuburi la loc"])
+        return {"grid": grid, "angles": look, "colors": memorized, "dest": colors, "errors": errors, **report}
 
     def look(self, timeout=3.0):
         """Ce vede detecția paginii pe un cadru procesat după acest moment (aceeași urmărire ca în pagină)."""
@@ -507,9 +521,11 @@ class Runner:
             time.sleep(0.03)
         with p.lock:
             corners = p.corners if p.corner_src == "auto" and p.missed == 0 else None
+            partial = p.partial if corners is None else None
+            lines = p.lines if corners is None and partial is None else None
         cubes = p.result["cubes"]
         h, w = (p.frame.shape[:2] if p.frame is not None else (C.CAM_H, C.CAM_W))
-        return {"corners": corners, "cubes": [o["box"] for o in cubes],
+        return {"corners": corners, "partial": partial, "lines": lines, "cubes": [o["box"] for o in cubes],
                 "cells": sum(1 for o in cubes if o.get("cell")), "size": (w, h)}
 
     def aim(self, rob, search=True, center=True):
@@ -538,7 +554,7 @@ class Runner:
         return self.thread is not None and self.thread.is_alive()
 
     def start(self, task):
-        if task not in ("task1", "task2", "aim", "rebuild", "learn_NEAR", "learn_FAR"):
+        if task not in ("task1", "task2", "aim", "rebuild"):
             raise ValueError("Sarcină necunoscută")
         if self.busy():
             raise ValueError("O sarcină rulează deja")
@@ -553,10 +569,8 @@ class Runner:
         try:
             rob = Robot(should_stop=self.stop_ev.is_set, on_look=self.pipeline.set_grid)
             self.log(f"Pornesc {task} (braț {'simulat' if rob.sim else 'REAL'})")
-            fn = {"task1": tasks.run_task1, "task2": tasks.run_task2, "aim": lambda r, ctx: ctx.memorize_only(r),
-                  "rebuild": lambda r, ctx: ctx.rebuild(r),
-                  "learn_NEAR": lambda r, ctx: ctx.learn_pick(r, "NEAR"),
-                  "learn_FAR": lambda r, ctx: ctx.learn_pick(r, "FAR")}[task]
+            fn = {"task1": tasks.run_task1, "task2": tasks.run_task2, "aim": lambda r, ctx: ctx.memorize(r),
+                  "rebuild": lambda r, ctx: ctx.rebuild(r)}[task]
             self.result = fn(rob, self)
             self.status = "gata"
         except Stopped:
@@ -623,6 +637,7 @@ class App:
         p = self.pipeline.state
         s = {
             "mode": self.mode, "sim": self.sim, "source": self.cam.source, "camera_error": self.cam.error,
+            "https_port": C.WEB_HTTPS_PORT,
             "vision": p, "view": self.pipeline.view, "settings": C.settings(),
             "colors_hex": {k: overlay.HEX.get(k, "#c060c0") for k in C.COLORS},
             "memorized": self.memorized, "verify": self.verify,
@@ -641,7 +656,7 @@ class App:
     @staticmethod
     def positions_missing():
         pos = load_positions()
-        return [n for n in REQUIRED if n not in pos] + pick.missing(pos)
+        return [n for n in REQUIRED if n not in pos]
 
     @staticmethod
     def preview_tower(stable):
@@ -677,7 +692,12 @@ class App:
         return {"ok": True}
 
     def a_settings(self, b):
-        C.apply_settings(b.get("values", {}))
+        values = b.get("values", {})
+        C.apply_settings(values)
+        if any(k.startswith("CAM_") for k in values):
+            failed = self.cam.controls()
+            if failed:
+                return self.say(f"Setări aplicate, dar camera nu acceptă: {', '.join(failed)}")
         if b.get("save"):
             C.save_settings()
             return self.say("Setări aplicate și salvate în settings.json")
@@ -702,6 +722,15 @@ class App:
         C.apply_settings({"AUTO_GRID": False})
         return self.say(f"Colțuri {grid} salvate în vision.json; caroiaj automat oprit")
 
+    def a_expose(self, b):
+        """Expunere manuală reglată pe foaia albă (vezi vision.auto_expose), apoi lăsată fixă."""
+        if self.cam.cap is None:
+            raise ValueError("Merge doar cu o cameră adevărată")
+        exp = vision.auto_expose(self.cam.cap, lambda: self.cam.fresh()[0], self.runner.log)
+        if exp is None:
+            raise ValueError("Nu am putut regla expunerea (vezi jurnalul)")
+        return self.say(f"Expunere fixă: {exp} (apasă Salvează ca să rămână)")
+
     def a_freeze(self, b):
         p = self.pipeline
         p.frozen = None if p.frozen is not None or p.frame is None else p.frame.copy()
@@ -712,7 +741,8 @@ class App:
         frame = self.pipeline.frame
         if frame is None:
             raise ValueError("Niciun cadru încă")
-        hsv = mean_hsv(frame, b["x"], b["y"])
+        # Pe imaginea normalizată (LIGHT_NORM), ca valorile învățate să fie cele pe care le folosește detecția.
+        hsv = mean_hsv(vision.normalize_light(frame), b["x"], b["y"])
         px = np.uint8([[hsv]])
         match = [n for n in C.COLORS if vision.color_mask(px, n)[0, 0]]
         return {"ok": True, "x": int(b["x"]), "y": int(b["y"]), "hsv": hsv, "match": match}
@@ -764,13 +794,6 @@ class App:
         self.runner.start("rebuild")
         return self.say("Pun cuburile înapoi pe caroiaj (orice buton de pe controller oprește)")
 
-    def a_learn_pick(self, b):
-        which = str(b.get("which", "")).upper()
-        if which not in ("NEAR", "FAR"):
-            raise ValueError("which = NEAR sau FAR")
-        self.runner.start(f"learn_{which}")
-        return self.say(f"Învăț prinderea {which}: un singur cub, pus unde a fost învățată PICK_{which}_jos")
-
     def a_stop(self, b):
         self.runner.stop()
         return self.say("Oprire cerută (se oprește la următoarea mișcare)")
@@ -797,12 +820,18 @@ class App:
 
     def a_camera(self, b):
         src = str(b.get("source", ""))
-        if not (src == "synth" or (src.startswith("camera:") and src[7:].isdigit())):
+        if not (src in ("synth", "synth-arm", "browser") or (src.startswith("camera:") and src[7:].isdigit())):
             raise ValueError("Sursă invalidă")
         self.cam.switch(src)
         self.pipeline.reset()
         vision.forget()     # altă cameră: altă focală
         return self.say(f"Sursa imaginii: {src}")
+
+    def a_scatter(self, b):
+        if not self.sim:
+            raise ValueError("Doar cu brațul simulat")
+        packed = WORLD.scatter(packed=b.get("packed"))
+        return self.say("Cuburile de pe S sunt acum într-un unghi mort" + (" (lipite)" if packed else ""))
 
     def a_synth(self, b):
         C.apply_settings({"SYNTH_LAYOUT": b["layout"]})
@@ -821,6 +850,29 @@ class App:
                 with open(f"{name}_{k}.jpg", "wb") as f:
                     f.write(self.pipeline.jpeg[k])
         return self.say(f"Salvat {os.path.relpath(name, C.ROOT)}*.jpg")
+
+    def a_record(self, b):
+        """Înregistrează N cadre brute (PNG, fără pierderi) pentru reglajul detecției fără braț: în
+        captures/set_<dată>/, cu meta.json (setări, colțuri) și labels.json = aranjarea detectată acum.
+        Verifici labels.json de mână, pui "verificat": true, apoi tests/test_captures.py le folosește."""
+        n = max(1, min(60, int(b.get("n", 10))))
+        folder = os.path.join(C.CAPTURES_DIR, time.strftime("set_%Y%m%d_%H%M%S"))
+        os.makedirs(folder)
+        seq = None
+        for i in range(n):
+            frame, seq = self.cam.fresh(after=seq)
+            vision.imwrite(os.path.join(folder, f"{i:02d}.png"), frame)
+            time.sleep(0.25)
+        st = self.pipeline.state
+        with open(os.path.join(folder, "meta.json"), "w", encoding="utf-8") as f:
+            json.dump({"grid": self.pipeline.grid, "corners": st.get("corners"), "source": self.cam.source,
+                       "settings": C.settings(), "light_gains": (lambda g: None if g is None else g.tolist())(
+                           vision.light_gains(frame))}, f, indent=2, ensure_ascii=False)
+        with open(os.path.join(folder, "labels.json"), "w", encoding="utf-8") as f:
+            json.dump({"verificat": False, "colors": st.get("stable") or st.get("colors")}, f, indent=2,
+                      ensure_ascii=False)
+        return self.say(f"{n} cadre în {os.path.relpath(folder, C.ROOT)}: verifică labels.json și pune "
+                        f"\"verificat\": true")
 
 
 APP = None
@@ -891,6 +943,8 @@ class Handler(BaseHTTPRequestHandler):
                 p.viewers[kind] -= 1
 
     def do_POST(self):
+        if self.path == "/push.jpg":
+            return self.push()
         name = self.path.split("?")[0].removeprefix("/api/").replace("/", "_")
         fn = getattr(APP, "a_" + name, None)
         if fn is None:
@@ -902,6 +956,18 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, KeyError, TypeError, RuntimeError) as e:
             self.send(400, {"ok": False, "error": str(e)})
 
+    def push(self):
+        """Un cadru JPEG de la camera laptopului (sursa "browser")."""
+        n = int(self.headers.get("Content-Length") or 0)
+        data = np.frombuffer(self.rfile.read(n), np.uint8)
+        if APP.cam.source != "browser":
+            return self.send(409, {"error": "Sursa imaginii nu e camera din browser"})
+        frame = cv2.imdecode(data, cv2.IMREAD_COLOR) if n else None
+        if frame is None:
+            return self.send(400, {"error": "JPEG invalid"})
+        APP.cam.push(frame)
+        self.send(200, {"ok": True})
+
 
 def local_ip():
     """IP-ul laptopului în rețeaua locală (fără să trimită nimic: doar alege interfața spre o adresă)."""
@@ -911,6 +977,30 @@ def local_ip():
             return sock.getsockname()[0]
     except OSError:
         return None
+
+
+def https_server(ip):
+    """Serverul https (pentru camera laptopului din browser), sau None + motivul dacă nu se poate.
+    Certificatul e făcut o dată, cu openssl; browserul îl arată ca „nesigur” până îl accepți."""
+    if not C.WEB_HTTPS_PORT:
+        return None, "https oprit (DOFBOT_HTTPS_PORT=0)"
+    try:
+        if not (os.path.exists(C.CERT_FILE) and os.path.exists(C.KEY_FILE)):
+            os.makedirs(C.DATA_DIR, exist_ok=True)
+            san = "DNS:localhost,IP:127.0.0.1" + (f",IP:{ip}" if ip else "")
+            subprocess.run(["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
+                            "-nodes", "-days", "3650", "-subj", "/CN=dofbot", "-addext", f"subjectAltName={san}",
+                            "-keyout", C.KEY_FILE, "-out", C.CERT_FILE],
+                           check=True, capture_output=True, timeout=30)
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(C.CERT_FILE, C.KEY_FILE)
+        server = ThreadingHTTPServer(("0.0.0.0", C.WEB_HTTPS_PORT), Handler)
+    except (OSError, subprocess.SubprocessError, ssl.SSLError) as e:
+        return None, f"fără https: {e}"
+    server.daemon_threads = True
+    # Handshake-ul TLS se face în firul cererii, nu în cel care acceptă conexiunile.
+    server.socket = ctx.wrap_socket(server.socket, server_side=True, do_handshake_on_connect=False)
+    return server, None
 
 
 def main():
@@ -930,6 +1020,13 @@ def main():
     APP = App()
     ip = local_ip()
     print(f"Pagina: {url}" + (f"  (de pe telefon / alt laptop din aceeași rețea: http://{ip}:{C.WEB_PORT})" if ip else ""))
+    hs, why = https_server(ip)
+    if hs:
+        threading.Thread(target=hs.serve_forever, daemon=True, name="https").start()
+        print(f"Camera laptopului: https://{ip or 'localhost'}:{C.WEB_HTTPS_PORT}  (prima dată: „Advanced” → "
+              f"„Proceed”, apoi sursa „Camera laptopului (browser)”)")
+    else:
+        print(why)
     if os.name == "nt":
         print("Dacă Windows întreabă de firewall: „Allow” / „Permite”, ca pagina să se vadă și din rețea.")
     print(f"Camera: {APP.cam.source} | braț: {'simulat' if APP.sim else 'real'}")

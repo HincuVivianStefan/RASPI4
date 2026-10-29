@@ -88,6 +88,9 @@ def open_camera(index=None):
             tried.append(f"{name}: imagine alb-negru (cameră infraroșu?)")
             continue
         _WORKED[index] = name
+        failed = camera_controls(cap)
+        if failed:
+            print(f"[camera] {index}: nu merg controalele: {', '.join(failed)}")
         return cap
     raise RuntimeError(f"Nu pot deschide camera {index} ({'; '.join(tried)}). Folosită de altă aplicație? "
                        f"Permisiune cameră? Alege alta din pagină")
@@ -154,10 +157,113 @@ def shrink(frame, width=PROC_W):
     return cv2.resize(frame, (width, round(h * s)), interpolation=cv2.INTER_AREA), s
 
 
+# ---------- lumina ----------
+# Foaia albă e în fiecare cadru: o aducem mereu la aceeași luminozitate și la gri (balans de alb). Așa
+# intervalele HSV din COLORS (mai ales pragurile V) înseamnă „față de hârtie”, nu valori absolute, și un verde
+# închis în lumină slabă rămâne verde. S (saturația) nu se schimbă cu lumina, doar cu nuanța ei.
+PAPER_V = 220         # la cât aducem foaia albă
+PAPER_MAX_S = 130     # „aproape gri”: foaia, și sub un bec cald; fețele colorate ale cuburilor au S peste
+PAPER_PCT = 80        # foaia = cele mai luminoase (peste această percentilă) dintre pixelii aproape gri
+DENOISE_GAIN = 1.8    # de la acest câștig zgomotul senzorului se vede: filtru median
+
+
+def paper_color(img):
+    """Culoarea foii albe (B, G, R) în imagine: mediana celor mai luminoși pixeli aproape gri. None dacă nu e."""
+    h, w = img.shape[:2]
+    small = img if w <= 160 else cv2.resize(img, (160, max(1, round(h * 160 / w))), interpolation=cv2.INTER_AREA)
+    hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+    gray = hsv[..., 1] < PAPER_MAX_S
+    if np.count_nonzero(gray) < 50:
+        return None
+    v = hsv[..., 2]
+    paper = gray & (v >= np.percentile(v[gray], PAPER_PCT))
+    return np.median(small[paper].astype(np.float32), axis=0)
+
+
+def light_gains(img):
+    """Câștigurile pe canal (B, G, R) care aduc foaia albă la PAPER_V, sau None dacă nu se vede nimic gri.
+    Doar luminăm (câștig ≥ 1), cel mult LIGHT_MAX_GAIN ori."""
+    ref = paper_color(img)
+    return None if ref is None else np.clip(PAPER_V / np.maximum(ref, 1.0), 1.0, C.LIGHT_MAX_GAIN)
+
+
+# ---------- controalele camerei (Linux / V4L2) ----------
+EXPOSE_TARGET = 200     # auto_expose: la ce luminozitate aducem foaia (sub 255, ca să nu se ardă)
+EXPOSE_RANGE = (1, 5000)
+
+
+def camera_controls(cap):
+    """Aplică CAM_EXPOSURE, CAM_GAIN, CAM_WB din setări (0 / -1 = lăsat pe automat). Pe brațul care se mișcă,
+    expunerea automată schimbă culorile de la o poză la alta; fixă, ele rămân la fel. Întoarce ce nu a mers
+    (nu toate camerele au toate controalele). Doar pe Linux: pe Windows valorile au alt sens."""
+    if os.name == "nt" or (C.CAM_EXPOSURE <= 0 and C.CAM_GAIN < 0 and C.CAM_WB <= 0):
+        return []
+    failed = []
+
+    def put(prop, value, name):
+        if not cap.set(prop, value):
+            failed.append(name)
+
+    if C.CAM_EXPOSURE > 0:
+        put(cv2.CAP_PROP_AUTO_EXPOSURE, 1, "expunere manuală")     # V4L2: 1 = manual, 3 = automat
+        put(cv2.CAP_PROP_EXPOSURE, C.CAM_EXPOSURE, "expunere")
+    else:
+        put(cv2.CAP_PROP_AUTO_EXPOSURE, 3, "expunere automată")
+    if C.CAM_GAIN >= 0:
+        put(cv2.CAP_PROP_GAIN, C.CAM_GAIN, "amplificare")
+    if C.CAM_WB > 0:
+        put(cv2.CAP_PROP_AUTO_WB, 0, "balans de alb manual")
+        put(cv2.CAP_PROP_WB_TEMPERATURE, C.CAM_WB, "balans de alb")
+    else:
+        put(cv2.CAP_PROP_AUTO_WB, 1, "balans de alb automat")
+    return failed
+
+
+def auto_expose(cap, get_frame, log=print, tries=8):
+    """Expunere manuală reglată până când foaia albă are V ≈ EXPOSE_TARGET, apoi lăsată fixă (în CAM_EXPOSURE,
+    se păstrează cu „Salvează”). get_frame() = un cadru nou. Întoarce expunerea sau None dacă nu a mers."""
+    exp = C.CAM_EXPOSURE if C.CAM_EXPOSURE > 0 else (cap.get(cv2.CAP_PROP_EXPOSURE) or 0)
+    exp = exp if exp > 0 else 150
+    if not cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1):
+        log("Camera nu acceptă expunere manuală.")
+        return None
+    for i in range(tries):
+        cap.set(cv2.CAP_PROP_EXPOSURE, exp)
+        for _ in range(3):              # cadrele deja pornite au expunerea veche
+            frame = get_frame()
+        ref = paper_color(frame)
+        if ref is None:
+            log("Nu văd foaia albă: pune caroiajul în fața camerei.")
+            return None
+        v = float(ref.max())
+        log(f"  expunere {exp:.0f}: foaia are {v:.0f}")
+        if abs(v - EXPOSE_TARGET) < 0.08 * EXPOSE_TARGET:
+            break
+        # Ars (255): nu știm cât de mult, deci doar înjumătățim; altfel luminozitatea e ~ proporțională cu expunerea.
+        exp = exp / 2 if v >= 250 else exp * EXPOSE_TARGET / max(v, 5.0)
+        exp = float(np.clip(exp, *EXPOSE_RANGE))
+    C.apply_settings({"CAM_EXPOSURE": int(round(exp))})
+    return C.CAM_EXPOSURE
+
+
+def normalize_light(img):
+    """Imaginea cu foaia adusă la alb (vezi light_gains). Fără efect cu LIGHT_NORM oprit sau în lumină bună.
+    Când câștigul e mare, și un filtru median: zgomotul amplificat ar strica și culorile, și liniile negre
+    (pe un pixel aproape negru, saturația e doar zgomot)."""
+    if not C.LIGHT_NORM:
+        return img
+    g = light_gains(img)
+    if g is None or g.max() < 1.03:
+        return img
+    lut = np.clip(np.arange(256, dtype=np.float32)[:, None] * g[None, :], 0, 255).astype(np.uint8)[None]
+    out = cv2.LUT(img, lut)
+    return cv2.medianBlur(out, 3) if g.max() >= DENOISE_GAIN else out
+
+
 def grid_mask(frame):
     """Pixelii negri ai caroiajului: linii subțiri mai întunecate decât hârtia din jur și nesaturate.
     Black-hat-ul păstrează doar ce e mai îngust decât fereastra lui, deci cuburile (mari) nu intră în mască."""
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    hsv = cv2.cvtColor(normalize_light(frame), cv2.COLOR_BGR2HSV)
     k = max(5, (frame.shape[1] // 50) | 1)
     bh = cv2.morphologyEx(hsv[..., 2], cv2.MORPH_BLACKHAT, cv2.getStructuringElement(cv2.MORPH_RECT, (k, k)))
     dark = np.where(bh > C.GRID_C, 255, 0).astype(np.uint8)
@@ -215,12 +321,19 @@ FIT_COVERED = 0.85  # cu cuburi peste caroiaj, liniile rămase vizibile trebuie 
 MAX_NUDGE = 6       # caroiaj aproape acoperit: cât (px, la GRID_W) are voie să se mute față de cadrul anterior
 
 
+def grid_points(pts, corners):
+    """Puncte din coordonatele caroiajului (0..3) în imagine, ca pixeli întregi. Cele care cad la infinit
+    (caroiaj extrapolat mult în afara imaginii) ies în afara oricărei imagini, nu dau erori."""
+    H = cv2.getPerspectiveTransform(_SQUARE, np.float32(corners))
+    q = np.nan_to_num(cv2.perspectiveTransform(pts, H)[0], nan=-1e6, posinf=-1e6, neginf=-1e6)
+    return np.rint(np.clip(q, -1e6, 1e6)).astype(np.int32)
+
+
 def fit_score(near, mask, corners, cov=None):
     """Cât de bine se suprapune un caroiaj 3x3 cu aceste colțuri peste liniile negre:
     partea din cele 8 linii care cade pe negru, minus partea din celule care e neagră.
     Punctele din `cov` (acoperite de cuburi) nu contează deloc."""
-    H = cv2.getPerspectiveTransform(_SQUARE, np.float32(corners))
-    p = np.rint(cv2.perspectiveTransform(_FIT_PTS, H)[0]).astype(np.int32)
+    p = grid_points(_FIT_PTS, corners)
     h, w = mask.shape
     ok = (p[:, 0] >= 0) & (p[:, 0] < w) & (p[:, 1] >= 0) & (p[:, 1] < h)
     x, y = np.where(ok, p[:, 0], 0), np.where(ok, p[:, 1], 0)
@@ -309,11 +422,13 @@ def find_grid(frame, prev=None):
     frame, s = shrink(frame, GRID_W)
     mask = grid_mask(frame)
     best, best_score = None, C.GRID_MIN_SCORE
+    sure = False    # cel mai bun caroiaj de până acum e sigur: nu mai căutăm altul
+    hidden = False  # caroiajul anterior e aproape tot acoperit: nici căutarea completă nu-l poate găsi
 
     near = cv2.dilate(mask, np.ones((3, 3), np.uint8))
 
     def consider(corners):
-        nonlocal best, best_score
+        nonlocal best, best_score, sure, hidden
         if not squareish(corners):
             return
         covered = cube_cover(full, [[x / s, y / s] for x, y in corners], s, mask.shape)
@@ -328,19 +443,23 @@ def find_grid(frame, prev=None):
             corners = fit_grid(mask, corners, cov=covered)
             wc = warp(covered, corners)
             if not squareish(corners) or wc.mean() / 255 > MAX_COVERED:
+                hidden = hidden or wc.mean() / 255 > MAX_COVERED
                 return
             fit = fit_score(near, mask, corners, covered)
             score = min(grid_score(warp(mask, corners), wc), fit) if fit >= FIT_COVERED else 0.0
         if score > best_score:
+            # Acoperit de cuburi, scorul nu poate fi mare, dar liniile rămase s-au potrivit foarte bine
+            # (FIT_COVERED): o căutare completă n-ar găsi altceva mai bun, doar ar costa.
             best, best_score = corners, score
+            sure = score >= FIT_GOOD or covered is not None
 
     if prev is not None:     # caroiajul e fix pe masă: de obicei ajunge o mică ajustare
         consider([[x * s, y * s] for x, y in prev])
-    if best_score < FIT_GOOD:   # căutare completă (și când camera s-a mutat): contur exterior + celule
+    if not sure and not hidden:   # căutare completă (și când camera s-a mutat): contur exterior + celule
         outer = grid_candidates(mask)
         if outer:
             consider(max(outer, key=lambda c: fit_score(near, mask, c)))
-        if best_score < FIT_GOOD:
+        if not sure:
             for corners in cell_candidates(mask, near)[:3]:
                 consider(corners)
     if best is None and prev is not None:
@@ -354,12 +473,123 @@ def find_grid(frame, prev=None):
                 fitted = start
             if fit_score(near, mask, fitted.tolist(), covered) >= FIT_COVERED:
                 return (fitted / s).tolist()
+    if best is None:
+        return grid_from_cubes(full)    # caroiaj plin: din rețeaua fețelor de sus ale cuburilor
+    return None if best is None else [[x / s, y / s] for x, y in best]
+
+
+VERIFY_OK = 0.6       # verify_grid: de la acest scor, caroiajul ținut minte chiar e încă acolo
+VERIFY_MIN_SEEN = 24  # sub atâtea puncte de linie neacoperite de cuburi, nu putem spune nimic
+
+
+def verify_grid(frame, corners):
+    """Caroiajul cu aceste colțuri chiar se vede în cadru? Scor 0..1 (cât din liniile neacoperite de cuburi
+    cad pe negru, minus celulele negre) sau None dacă aproape totul e acoperit și nu se poate spune.
+    Ieftin (câteva ms): se rulează la fiecare cadru, ca un caroiaj dispărut să nu mai rămână desenat."""
+    small, s = shrink(frame, GRID_W)
+    mask = grid_mask(small)
+    # ±2 px: caroiajul ținut minte e aproape, dar nu la pixel (netezire, cadre noi). Un caroiaj real dă ~0,95,
+    # unul mutat cu 12 px ~0,15, unul dispărut 0.
+    near = cv2.dilate(mask, np.ones((5, 5), np.uint8))
+    c = np.float32(corners) * s
+    cov = cube_cover(frame, corners, s, mask.shape)
+    if cov is not None:
+        H = cv2.getPerspectiveTransform(_SQUARE, c)
+        p = np.rint(cv2.perspectiveTransform(_FIT_PTS, H)[0]).astype(np.int32)
+        h, w = mask.shape
+        ok = (p[:, 0] >= 0) & (p[:, 0] < w) & (p[:, 1] >= 0) & (p[:, 1] < h)
+        x, y = np.where(ok, p[:, 0], 0), np.where(ok, p[:, 1], 0)
+        if np.count_nonzero((ok & (cov[y, x] == 0))[:len(_LINE_PTS)]) < VERIFY_MIN_SEEN:
+            return None
+    return fit_score(near, mask, c.tolist(), cov)
+
+
+# ---------- caroiajul văzut doar parțial ----------
+# Brațul vede doar un colț: caroiajul iese din imagine. Îl extrapolăm (colțurile pot fi în afara imaginii) ca să
+# știm încotro să mutăm camera; culorile nu se citesc dintr-un caroiaj parțial.
+_E = np.concatenate([np.linspace(-0.6, -0.2, 5), np.linspace(3.2, 3.6, 5)])
+_EXT_PTS = np.float32(np.vstack([np.column_stack([np.full_like(_E, k), _E]) for k in range(4)] +
+                                [np.column_stack([_E, np.full_like(_E, k)]) for k in range(4)]))[None]
+PARTIAL_OK = 0.75       # potrivirea minimă pe partea vizibilă
+PARTIAL_MIN_SEEN = 0.2  # cât din linii trebuie să cadă în imagine, neacoperite de cuburi
+PARTIAL_TRIES = 6       # câte ipoteze ajustăm (cele mai promițătoare)
+
+
+def partial_score(near, mask, corners, cov):
+    """(scor, cât din linii se vede): ca fit_score, doar pe ce e în imagine și neacoperit, minus partea din
+    prelungirile liniilor dincolo de margini care e neagră (după marginea caroiajului e hârtie albă; o ipoteză
+    care pune marginea în mijlocul caroiajului adevărat pierde aici)."""
+    h, w = mask.shape
+    fit = fit_score(near, mask, corners, cov)
+    p = grid_points(_FIT_PTS, corners)[:len(_LINE_PTS)]
+    ok = (p[:, 0] >= 0) & (p[:, 0] < w) & (p[:, 1] >= 0) & (p[:, 1] < h)
+    seen = np.count_nonzero(ok & (cov[np.where(ok, p[:, 1], 0), np.where(ok, p[:, 0], 0)] == 0)) / len(p)
+    e = grid_points(_EXT_PTS, corners)
+    ok = (e[:, 0] >= 0) & (e[:, 0] < w) & (e[:, 1] >= 0) & (e[:, 1] < h)
+    ok &= cov[np.where(ok, e[:, 1], 0), np.where(ok, e[:, 0], 0)] == 0
+    ext = np.count_nonzero(near[e[ok, 1], e[ok, 0]]) / max(np.count_nonzero(ok), 1) if ok.sum() >= 5 else 0.0
+    return fit - ext, seen
+
+
+LINES_HINT_MIN = 0.004   # lines_hint: din pixelii imaginii, sub atât liniile negre văzute sunt zgomot
+
+
+def lines_hint(frame):
+    """Unde sunt liniile negre subțiri din cadru: (centrul lor x, y, ca fracțiuni din imagine) sau None.
+    Ultima rezervă a centrării: nu se vede caroiajul, nici o parte recunoscută din el, nici cuburi, dar o bucată
+    de linie la marginea imaginii spune încotro e."""
+    small, _ = shrink(frame, PROC_W)
+    m = grid_mask(small)
+    if np.count_nonzero(m) < LINES_HINT_MIN * m.size:
+        return None
+    ys, xs = np.nonzero(m)
+    return float(xs.mean()) / m.shape[1], float(ys.mean()) / m.shape[0]
+
+
+def body_cover(cubes, s, shape):
+    """Ce acoperă cuburile găsite fără caroiaj (doar fața de sus în imagine): fața și corpul de sub ea, la scara s."""
+    cov = np.zeros(shape, np.uint8)
+    for o in cubes:
+        box = np.float32(o["box"]) * s
+        (_, _), (bw, bh), _ = cv2.minAreaRect(box)
+        body = np.float32(np.vstack([box, box + [0, max(bw, bh)]]))   # văzut de sus-oblic, corpul e sub față
+        cv2.fillConvexPoly(cov, np.int32(cv2.convexHull(body)), 255)
+    return cv2.dilate(cov, np.ones((9, 9), np.uint8))
+
+
+def find_partial_grid(frame):
+    """Caroiajul ieșit parțial din imagine: colțurile lui (extrapolate, și în afara imaginii) sau None."""
+    small, s = shrink(frame, GRID_W)
+    mask = grid_mask(small)
+    near = cv2.dilate(mask, np.ones((3, 3), np.uint8))
+    cubes, _ = find_cubes(frame)
+    cov = body_cover(cubes, s, mask.shape)
+    cands = cell_candidates(mask, near)
+    if len(cubes) >= LATTICE_MIN:
+        g = grid_from_cubes(frame)      # cuburile, chiar și doar o parte din ele, dau rețeaua
+        if g is not None:
+            cands.insert(0, [[x * s, y * s] for x, y in g])
+    # Ipotezele dintr-o singură celulă sunt aproximative: le ordonăm cu toleranță mare (±4 px), apoi le ajustăm
+    # pe cele mai promițătoare și le judecăm strict.
+    wide = cv2.dilate(mask, np.ones((9, 9), np.uint8))
+    ranked = []
+    for c in cands:
+        if squareish(c):
+            sc, seen = partial_score(wide, mask, c, cov)
+            if seen >= PARTIAL_MIN_SEEN:
+                ranked.append((sc, c))
+    best, best_score = None, PARTIAL_OK
+    for _, c in sorted(ranked, key=lambda t: -t[0])[:PARTIAL_TRIES]:
+        c = fit_grid(mask, c, steps=(4, 2, 1), cov=cov)
+        sc, seen = partial_score(near, mask, c, cov)
+        if seen >= PARTIAL_MIN_SEEN and sc > best_score and squareish(c):
+            best, best_score = c, sc
     return None if best is None else [[x / s, y / s] for x, y in best]
 
 
 def cube_cover(frame, corners, s, shape):
     """Masca (la scara s) a ce acoperă cuburile găsite pe acest caroiaj: tot corpul lor, nu doar fața colorată."""
-    cubes, _ = find_cubes(frame, corners)
+    cubes, _ = find_cubes(frame, corners, fast=True)
     if not cubes:
         return None
     cov = np.zeros(shape, np.uint8)
@@ -439,11 +669,26 @@ def _K(f, w, h):
     return np.array([[f, 0, w / 2], [0, f, h / 2], [0, 0, 1.0]])
 
 
+_FS = np.exp(np.linspace(np.log(0.4), np.log(5), 120))   # focalele încercate, × lățimea imaginii
+
+
+def _pose_errs(H, fs, w, h):
+    """_pose_err pentru toate focalele `fs` deodată (inversa lui K e cunoscută: fără 120 de inversări)."""
+    H = np.asarray(H, float)
+    r0 = (H[0] - w / 2 * H[2])[None, :] / fs[:, None]
+    r1 = (H[1] - h / 2 * H[2])[None, :] / fs[:, None]
+    r2 = np.broadcast_to(H[2], r0.shape)
+    a1 = np.stack([r0[:, 0], r1[:, 0], r2[:, 0]], 1)
+    a2 = np.stack([r0[:, 1], r1[:, 1], r2[:, 1]], 1)
+    n1, n2 = np.linalg.norm(a1, axis=1), np.linalg.norm(a2, axis=1)
+    return (np.sum(a1 * a2, 1) / (n1 * n2)) ** 2 + ((n1 - n2) / (n1 + n2)) ** 2
+
+
 def learn_focal(H, w, h):
     """Focala pentru care caroiajul văzut e un pătrat adevărat în 3D. O păstrăm doar dacă potrivirea
     e foarte bună (caroiaj neacoperit, colțuri exacte); cu cuburi peste colțuri estimarea e prea zgomotoasă."""
-    fs = w * np.exp(np.linspace(np.log(0.4), np.log(5), 120))
-    errs = np.array([_pose_err(H, _K(f, w, h)) for f in fs])
+    fs = w * _FS
+    errs = _pose_errs(H, fs, w, h)
     i = int(np.argmin(errs))
     near = errs[np.abs(np.log(fs / fs[i])) < np.log(1.5)]
     if errs[i] < FOCAL_MAX_ERR and 0 < i < len(fs) - 1 and min(errs[0], errs[-1], near.max()) > errs[i] + FOCAL_MIN_GAIN:
@@ -457,13 +702,19 @@ def focal(w):
     return (float(np.median(_FOCALS)) if _FOCALS else C.CAM_FOCAL_GUESS) * w
 
 
-def camera_pose(corners, w, h):
-    """Poza camerei față de caroiaj: (P = matricea de proiecție 3x4, poziția camerei în lume)."""
+def camera_pose(corners, w, h, learn=True):
+    """Poza camerei față de caroiaj: (P = matricea de proiecție 3x4, poziția camerei în lume).
+    learn = colțurile sunt ale caroiajului găsit (nu un candidat încercat): din ele se poate învăța focala."""
     H = cv2.getPerspectiveTransform(np.float32([[0, 0], [3, 0], [3, 3], [0, 3]]),
                                     np.float32(corners)).astype(float)
-    if C.CAM_FOCAL <= 0:
+    if C.CAM_FOCAL <= 0 and learn:
         learn_focal(H, w, h)
-    K = _K(focal(w), w, h)
+    return pose_from_homography(H, focal(w), w, h)
+
+
+def pose_from_homography(H, f, w, h):
+    """Ca camera_pose, din omografia plan → imagine și focala f (pixeli)."""
+    K = _K(f, w, h)
     a = np.linalg.inv(K) @ H
     lam = 2 / (np.linalg.norm(a[:, 0]) + np.linalg.norm(a[:, 1]))
     if a[2, 2] < 0:   # caroiajul e în fața camerei
@@ -636,14 +887,31 @@ def visible_lines(small, s, P):
     return pts[ok], seen[ok]
 
 
+def in_hull(pts, poly, margin=0):
+    """Care puncte cad în învelitoarea convexă a lui `poly`: margin > 0 = la cel puțin atâția px înăuntru,
+    margin < 0 = și până la -margin px în afară. Desenăm poligonul într-o mască mică (toate punctele dintr-o
+    dată), nu pointPolygonTest pe fiecare punct (de sute de ori mai lent)."""
+    hull = cv2.convexHull(np.float32(poly)).reshape(-1, 2)
+    pad = abs(margin) + 2
+    x0, y0 = np.floor(hull.min(axis=0)) - pad
+    w, h = (np.ceil(hull.max(axis=0)) + pad - [x0, y0] + 1).astype(int)
+    mask = np.zeros((h, w), np.uint8)
+    cv2.fillConvexPoly(mask, np.int32(np.rint(hull - [x0, y0])), 255)
+    if margin:
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * abs(margin) + 1,) * 2)
+        mask = cv2.erode(mask, k) if margin > 0 else cv2.dilate(mask, k)
+    xi, yi = np.rint(pts[:, 0] - x0).astype(int), np.rint(pts[:, 1] - y0).astype(int)
+    ok = (xi >= 0) & (xi < w) & (yi >= 0) & (yi < h)
+    out = np.zeros(len(pts), bool)
+    out[ok] = mask[yi[ok], xi[ok]] > 0
+    return out
+
+
 def lines_under(body_top, body_base, blob, lines):
     """Ce parte din liniile caroiajului de sub corpul cubului (în afara feței colorate) se vede. Corpul
     le ascunde, deci la varianta corectă ies puține. None dacă sub corp nu e nicio linie."""
     pts, seen = lines
-    body = cv2.convexHull(np.float32(np.vstack([body_top, body_base])))
-    face = cv2.convexHull(np.float32(blob))
-    inside = np.array([cv2.pointPolygonTest(body, (float(x), float(y)), True) > 2 and
-                       cv2.pointPolygonTest(face, (float(x), float(y)), True) < -3 for x, y in pts], bool)
+    inside = in_hull(pts, np.vstack([body_top, body_base]), 2) & ~in_hull(pts, blob, -3)
     n = int(inside.sum())
     return seen[inside].mean() if n >= LINES_MIN else None
 
@@ -687,24 +955,26 @@ SPLIT_PEAK = 0.6    # vârfurile hărții de distanțe (× maximul) care conteaz
 HALF_ASPECT = (1.6, 2.6)   # o pată respinsă cu raportul ăsta poate fi două fețe lipite: încercăm jumătățile
 
 
-def find_cubes(frame, corners=None, ref=None):
+def find_cubes(frame, corners=None, fast=False):
     """Caută cuburile ca obiecte: pete de culoare de mărimea unui cub, aproape pătrate și pline.
     Petele mai mici decât un cub sunt zgomot și se ignoră. Întoarce (cuburi, respinse);
     fiecare e un dict cu color, center, box, angle, area (× celulă), aspect, fill, reason.
     Cu caroiajul găsit, forma se judecă pe planul mesei (văzută de sus), iar `center` e centrul bazei
     cubului; `cube3d` = colțurile feței de sus și ale bazei, în imagine, pentru desen; `face` = pe ce parte
-    e fața colorată (sus sau o latură, vezi FACES): cubul poate fi întors, cu sus alb."""
+    e fața colorată (sus sau o latură, vezi FACES): cubul poate fi întors, cu sus alb.
+    fast = doar cât acoperă cuburile (pentru căutarea caroiajului): fără ipoteza „cub întors”."""
     small, s = shrink(frame)
+    small = normalize_light(small)
     hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
     h, w = small.shape[:2]
     # Mărimea de referință: o celulă a caroiajului; fără caroiaj, ~1/50 din imagine.
-    # ref = fără caroiaj, mărimea unui cub ca fracțiune din imagine (de aproape, deasupra cubului, e mult mai mare).
-    ref = cv2.contourArea(np.float32(corners)) * s * s / 9 if corners else h * w * (ref or 1 / 50)
+    ref = cv2.contourArea(np.float32(corners)) * s * s / 9 if corners else h * w / 50
     P = cam = to_table = None
     if corners:
         to_table = cv2.getPerspectiveTransform(np.float32(corners), np.float32([[0, 0], [3, 0], [3, 3], [0, 3]]))
         if C.CUBE_3D:
-            P, cam = camera_pose(corners, frame.shape[1], frame.shape[0])
+            # În căutarea caroiajului (fast) colțurile sunt doar candidați: nu învățăm focala din ei.
+            P, cam = camera_pose(corners, frame.shape[1], frame.shape[0], learn=not fast)
             if cam[2] <= 0.5:
                 P = cam = None
     kernel = np.ones((3, 3), np.uint8)
@@ -728,7 +998,7 @@ def find_cubes(frame, corners=None, ref=None):
             if cam is not None:
                 base_c, side, levels, top, base = lift_cube(pts, cam)
                 # Sau fața colorată e o latură (cub întors): o credem dacă așa iese mai pătrată.
-                sc = side_cube(img_pts, P, cam, to_table)
+                sc = None if fast else side_cube(img_pts, P, cam, to_table)
                 use_side = False
                 if sc:
                     err_top, err_side = square_err(rect, area), square_err(sc["rect"], sc["area"])
@@ -781,7 +1051,7 @@ def find_cubes(frame, corners=None, ref=None):
             (rejected if obj["reason"] else cubes).append(obj)
             if obj["reason"] in ("alungit", "formă") and obj["cube3d"] is not None:
                 partial.append((obj, img_pts))
-    if partial and cubes:
+    if partial and cubes and not fast:
         # Fețe tăiate de cuburile din fața lor: le refacem din marginea de sus.
         a = C.CUBE_SIDE or float(np.median([np.sqrt(o["area"]) for o in cubes]))
         occluders = [cv2.convexHull(np.float32(o["cube3d"]["top"] + o["cube3d"]["base"]))
@@ -802,6 +1072,92 @@ def find_cubes(frame, corners=None, ref=None):
         rejected.extend(cubes[C.MAX_CUBES:])
         cubes = cubes[:C.MAX_CUBES]
     return cubes, rejected
+
+
+# ---------- caroiajul plin, găsit din cuburi ----------
+# Cu 9 cuburi pe caroiaj, liniile se văd prea puțin ca să-l găsim de la zero. Fețele de sus ale cuburilor sunt însă
+# clare și stau pe o rețea 3x3, pe planul aflat la înălțimea cubului. Pornind de la fiecare față, încercăm toate
+# cele 9 celule în care poate fi; ipoteza bună pune și celelalte fețe pe centrele celulelor. Cu rețeaua găsită și
+# focala camerei aflăm poza camerei; coborând planul cu latura cubului ajungem la caroiajul de pe masă, pe care îl
+# ajustăm apoi pe liniile care se mai văd printre cuburi.
+_LATTICE = np.float32([[c + 0.5, r + 0.5] for r in range(3) for c in range(3)])
+LATTICE_MIN = 4          # cel puțin atâtea fețe pe rețea
+LATTICE_TOL = 0.35       # cât de departe (în celule) de centrul celulei poate fi o față (cuburi puse neglijent)
+LATTICE_FACE = (0.5, 0.65, 0.8)   # latura feței colorate, în celule (nu o știm: încercăm câteva)
+
+
+def face_lattice(cubes):
+    """(omografia rețea → imagine pe planul fețelor de sus, indicii fețelor folosite) sau None."""
+    centers = np.float32([np.mean(o["box"], axis=0) for o in cubes])
+    best = None
+    for o in cubes:
+        quad = np.float32(order_corners(o["box"]))
+        side = np.mean([np.linalg.norm(quad[i] - quad[(i + 1) % 4]) for i in range(4)])
+        for q in LATTICE_FACE:
+            square = np.float32([[-q / 2, -q / 2], [q / 2, -q / 2], [q / 2, q / 2], [-q / 2, q / 2]])
+            for cell in _LATTICE:
+                H = cv2.getPerspectiveTransform(square + cell, quad)
+                pred = cv2.perspectiveTransform(_LATTICE[None], H)[0]
+                d = np.linalg.norm(centers[:, None] - pred[None], axis=2)   # fețe × celule
+                near, idx = d.min(1), d.argmin(1)
+                tol = LATTICE_TOL * side / q
+                inl = near < tol
+                if len(set(idx[inl])) < inl.sum():      # două fețe în aceeași celulă: ipoteză greșită
+                    continue
+                score = inl.sum() - 0.1 * near[inl].sum() / tol
+                if best is None or score > best[0]:
+                    best = (score, idx[inl], np.flatnonzero(inl))
+    if best is None or len(best[1]) < LATTICE_MIN:
+        return None
+    _, cells, used = best
+    H, _ = cv2.findHomography(_LATTICE[cells], centers[used])
+    return None if H is None else (H, used)
+
+
+def grid_from_cubes(frame):
+    """Caroiajul (aproape) plin, găsit din rețeaua fețelor de sus ale cuburilor, sau None."""
+    cubes, _ = find_cubes(frame)
+    if len(cubes) < LATTICE_MIN:
+        return None
+    found = face_lattice(cubes)
+    if found is None:
+        return None
+    Ht, used = found
+    h, w = frame.shape[:2]
+    top = cv2.perspectiveTransform(np.float32([[[0, 0], [3, 0], [3, 3], [0, 3]]]), Ht)[0]
+    if (not np.all(np.isfinite(top)) or not squareish(top.tolist())
+            or not cv2.isContourConvex(np.float32(top).reshape(-1, 1, 2))):
+        return None
+    Hs = cv2.getPerspectiveTransform(np.float32([[0, 0], [3, 0], [3, 3], [0, 3]]), top).astype(float)
+    # Latura cubului (în celule), din mărimea fețelor duse pe planul lor.
+    inv = np.linalg.inv(Ht)
+    a = float(np.median([np.sqrt(cv2.contourArea(cv2.perspectiveTransform(np.float32([cubes[i]["box"]]), inv)[0]))
+                         for i in used])) / C.CUBE_TOP
+    # Focala: cea știută și cea pentru care rețeaua fețelor e un pătrat adevărat; păstrăm ce se potrivește mai bine.
+    fs = w * _FS
+    focals = {focal(w), float(fs[int(np.argmin(_pose_errs(Hs, fs, w, h)))])}
+    small, s = shrink(frame, GRID_W)
+    mask = grid_mask(small)
+    near = cv2.dilate(mask, np.ones((5, 5), np.uint8))
+    best, best_score = None, FIT_COVERED
+    for f in focals:
+        try:
+            P, _ = pose_from_homography(Hs, f, w, h)
+        except np.linalg.LinAlgError:
+            continue
+        table = project(P, [[0, 0, -a], [3, 0, -a], [3, 3, -a], [0, 3, -a]])
+        if not np.all(np.isfinite(table)):
+            continue
+        c = [[x * s, y * s] for x, y in table]
+        cov = cube_cover(frame, table.tolist(), s, mask.shape)
+        c = fit_grid(mask, c, steps=(4, 2, 1), cov=cov)
+        corners = [[x / s, y / s] for x, y in c]
+        if not squareish(corners):
+            continue
+        score = fit_score(near, mask, c, cube_cover(frame, corners, s, mask.shape))
+        if score > best_score:
+            best, best_score = corners, score
+    return best
 
 
 def cubes_inside(frame, corners):
@@ -841,7 +1197,7 @@ def faces_grid(cubes):
 def detect_full(frame, corners):
     """Toată detecția pe un caroiaj: culori 3x3, fracțiuni de pixeli, cuburi găsite / respinse, vederea de sus,
     și pe ce parte e fața colorată a fiecărui cub (faces)."""
-    top = warp(frame, corners)
+    top = warp(normalize_light(frame), corners)
     cubes, rejected = find_cubes(frame, corners)
     fracs = None
     if C.CUBE_MODE:

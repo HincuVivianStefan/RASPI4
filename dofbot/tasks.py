@@ -71,7 +71,7 @@ def run_task1(rob, ctx):
         rob.pick(a)
         rob.place(b)
 
-    synth_cam = camera.shared.source == "synth" if camera.shared else C.TEST_IMAGE == "synth"
+    synth_cam = camera.shared.source.startswith("synth") if camera.shared else C.TEST_IMAGE == "synth"
     if rob.sim and not synth_cam:
         # Brațul simulat nu a mutat nimic în realitate: aranjează tu destinația ca să vezi verificarea.
         ctx.pause("[SIM] Aranjează caroiajul destinație în fața camerei, apoi continuă.")

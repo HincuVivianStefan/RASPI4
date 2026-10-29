@@ -49,9 +49,10 @@ def grid_corners(size=(640, 480)):
     return _project(_camera(size), [[0, 0, 0], [3, 0, 0], [3, 3, 0], [0, 3, 0]]).tolist()
 
 
-def _draw_cube(img, P, x, y, color, height, face="sus", yaw=0.0):
+def _draw_cube(img, P, x, y, color, height, face="sus", yaw=0.0, eye=None):
     """face = pe ce parte e fața colorată: "sus", "fata" (spre rândul 3), "spate", "stanga", "dreapta"
-    (cea de pe o latură nevăzută nu apare). yaw = rotația cubului pe masă, în grade."""
+    (cea de pe o latură nevăzută nu apare). yaw = rotația cubului pe masă, în grade. eye = poziția camerei."""
+    eye = EYE if eye is None else eye
     s, z = SIDE / 2, SIDE * height
     t = np.radians(yaw)
     rot = np.array([[np.cos(t), -np.sin(t)], [np.sin(t), np.cos(t)]])
@@ -66,8 +67,8 @@ def _draw_cube(img, P, x, y, color, height, face="sus", yaw=0.0):
                                 ((2, 3), "fata", 218), ((3, 0), "stanga", 200)):
         mid = (base[a] + base[b]) / 2
         normal = mid - [x, y]
-        if normal @ (EYE[:2] - mid) > 0:
-            sides.append((-np.hypot(*(EYE[:2] - mid)), a, b, name, shade))
+        if normal @ (eye[:2] - mid) > 0:
+            sides.append((-np.hypot(*(eye[:2] - mid)), a, b, name, shade))
     for _, a, b, name, shade in sorted(sides):
         quad = np.array([lo[a], lo[b], hi[b], hi[a]])
         poly = np.int32(np.rint(_project(P, quad)))
@@ -84,41 +85,66 @@ def _draw_cube(img, P, x, y, color, height, face="sus", yaw=0.0):
         cv2.fillConvexPoly(img, np.int32(np.rint(_project(P, inset))), bgr, cv2.LINE_AA)
 
 
-def render(cells, size=(640, 480), seed=0, noise=6.0, jitter=6, yaw=0.0):
+def render(cells, size=(640, 480), seed=0, noise=6.0, jitter=6, yaw=0.0, lines=True, paper=True,
+           light=1.0, cast=(1.0, 1.0, 1.0)):
     """cells[r][c] = culoare, None, (culoare, înălțime) sau (culoare, înălțime, fața colorată).
     jitter = cât de departe de centrul celulei e pus cubul (pixeli de foaie, max); yaw = cât de rotit (grade, max).
+    lines / paper = False: fără liniile caroiajului / fără foaie (caroiajul luat de pe masă).
+    light = cât de multă lumină (1 = normal, 0.3 = sală întunecată); cast = nuanța ei pe canale (R, G, B),
+    ex. (1.0, 0.85, 0.6) = bec cald. Zgomotul senzorului rămâne același, deci în întuneric contează mai mult.
     Întoarce imaginea BGR."""
+    return render_scenes([(cells, _camera(size), EYE)], size, seed, noise, jitter, yaw, lines, paper, light, cast)
+
+
+def render_scenes(scenes, size=(640, 480), seed=0, noise=6.0, jitter=6, yaw=0.0, lines=True, paper=True,
+                  light=1.0, cast=(1.0, 1.0, 1.0), loose=None):
+    """Ca render, dar cu oricâte caroiaje, fiecare cu camera lui: scenes = [(cells, P, eye)], unde P (3x4)
+    proiectează coordonatele caroiajului (în celule) în imagine, iar eye = poziția camerei în aceleași coordonate.
+    Un caroiaj aflat (și parțial) în spatele camerei nu se desenează.
+    loose = (P, eye, [(x, y, culoare, yaw)]): cuburi puse oriunde pe masă, în coordonatele lui P."""
     rng = np.random.default_rng(seed)
-    paper = np.full((PAPER, PAPER, 3), 235, np.uint8)
+    sheet = np.full((PAPER, PAPER, 3), 235, np.uint8)
     o = (PAPER - GRID) // 2
     step = GRID // 3
-    for i in range(4):
+    for i in range(4 if lines else 0):
         p = o + i * step
-        cv2.line(paper, (p, o), (p, o + GRID), (25, 25, 25), LINE)
-        cv2.line(paper, (o, p), (o + GRID, p), (25, 25, 25), LINE)
+        cv2.line(sheet, (p, o), (p, o + GRID), (25, 25, 25), LINE)
+        cv2.line(sheet, (o, p), (o + GRID, p), (25, 25, 25), LINE)
 
     w, h = size
-    P = _camera(size)
     img = np.full((h, w, 3), (95, 105, 110), np.uint8)   # masa
-    cv2.warpPerspective(paper, _paper_to_image(P), (w, h), dst=img, borderMode=cv2.BORDER_TRANSPARENT)
-
-    cubes = []
-    for r in range(3):
-        for c in range(3):
-            v = cells[r][c]
-            color, height, face = (tuple(v) + ("sus",))[:3] if isinstance(v, (tuple, list)) else (v, 1, "sus")
-            if not color or height < 1:
-                continue
-            x = c + 0.5 + rng.integers(-jitter, jitter + 1) / CELL
-            y = r + 0.5 + rng.integers(-jitter, jitter + 1) / CELL
-            cubes.append((x, y, color, height, face, rng.uniform(-yaw, yaw) if yaw else 0.0))
-    # Întâi cele mai depărtate de cameră, ca cele din față să le acopere.
-    for x, y, color, height, face, turn in sorted(cubes, key=lambda q: -np.hypot(q[0] - EYE[0], q[1] - EYE[1])):
-        _draw_cube(img, P, x, y, color, height, face, turn)
+    m = (PAPER - GRID) / 2 / CELL                         # marginea foii, în celule
+    for cells, P, eye in scenes:
+        edge = np.array([[-m, -m, 0, 1], [3 + m, -m, 0, 1], [3 + m, 3 + m, 0, 1], [-m, 3 + m, 0, 1]]) @ P.T
+        if edge[:, 2].min() <= 1e-3 * np.abs(edge[:, 2]).max():
+            continue
+        if paper:
+            cv2.warpPerspective(sheet, _paper_to_image(P), (w, h), dst=img, borderMode=cv2.BORDER_TRANSPARENT)
+        cubes = []
+        for r in range(3):
+            for c in range(3):
+                v = cells[r][c]
+                color, height, face = (tuple(v) + ("sus",))[:3] if isinstance(v, (tuple, list)) else (v, 1, "sus")
+                if not color or height < 1:
+                    continue
+                x = c + 0.5 + rng.integers(-jitter, jitter + 1) / CELL
+                y = r + 0.5 + rng.integers(-jitter, jitter + 1) / CELL
+                cubes.append((x, y, color, height, face, rng.uniform(-yaw, yaw) if yaw else 0.0))
+        # Întâi cele mai depărtate de cameră, ca cele din față să le acopere.
+        for x, y, color, height, face, turn in sorted(cubes, key=lambda q: -np.hypot(q[0] - eye[0], q[1] - eye[1])):
+            _draw_cube(img, P, x, y, color, height, face, turn, eye)
+    if loose:
+        P, eye, cubes = loose
+        far = sorted(cubes, key=lambda q: -np.hypot(q[0] - eye[0], q[1] - eye[1]))
+        for x, y, color, turn in far:
+            # doar cuburile din fața camerei (cu toate colțurile)
+            pts = np.array([[x + dx, y + dy, dz, 1] for dx in (-1, 1) for dy in (-1, 1) for dz in (0, SIDE)]) @ P.T
+            if pts[:, 2].min() > 1e-3:
+                _draw_cube(img, P, x, y, color, 1, "sus", turn, eye)
 
     # Lumină neuniformă + zgomot de senzor (zgomotul e pregătit o dată; generarea lui la fiecare cadru e lentă).
     xs = np.linspace(0.85, 1.08, w, dtype=np.float32)
-    img = img.astype(np.float32) * xs[None, :, None]
+    img = img.astype(np.float32) * xs[None, :, None] * light * np.float32(cast[::-1])[None, None, :]
     img += _noise(img.shape, noise, seed % 4)
     return np.clip(img, 0, 255).astype(np.uint8)
 

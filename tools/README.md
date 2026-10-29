@@ -43,13 +43,6 @@ Pozițiile necesare (39 în total; pagina arată câte mai lipsesc):
 | `S11_jos` … `S33_jos`, `D11_jos` … `D33_jos` | gripperul jos, la cubul de pe masă, în fiecare celulă |
 | `S11_sus` … `D33_sus` | deasupra celulei, la înălțimea a 6 cuburi |
 
-| `PICK_NEAR_sus`, `PICK_NEAR_jos` | cu **baza la 90°**: deasupra / în jurul unui cub pus pe masă aproape de braț, în afara caroiajului |
-| `PICK_FAR_sus`, `PICK_FAR_jos` | la fel, pentru un cub pus departe (cât de departe pot ajunge cuburile luate de pe caroiaj) |
-
-Pozițiile `PICK_*` servesc Sarcinii 1 (cuburile căutate stânga / dreapta): brațul e simetric în jurul bazei, deci prinde la orice unghi
-interpolând între ele. La `_sus`, cubul trebuie să se vadă în cameră. Lasă cubul pe loc și apasă în pagină „Învață prinderea” (aproape, apoi departe).
-Dacă la prindere încheietura se rotește invers față de cub, schimbă `WRIST_SIGN` în `dofbot/pick.py` la `-1`.
-
 Nivelurile turnului se calculează între `_jos` și `_sus`. Dacă la un nivel brațul nu nimerește, învață poziția exactă, de exemplu `S22_n3`.
 
 ## center_grid.py – brațul își centrează caroiajul

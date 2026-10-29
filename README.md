@@ -21,6 +21,7 @@ Pe Windows, dacă ceva nu merge (de exemplu camera): închide `start.bat` și d�
 
 Pe laptop, brațul e **simulat** automat, pentru că acolo nu există `Arm_Lib`. Pe Pi se folosește brațul real.
 Sursa imaginii se alege din pagină: **Camera 0–3** sau **Scenă simulată**, adică un caroiaj desenat pe care brațul simulat chiar mută cuburile. Așa poți testa ambele sarcini cap-coadă fără braț și fără cameră.
+Sursa **Camera laptopului (browser)**: pagina deschisă pe laptop trimite la Pi imaginea camerei laptopului. Browserul dă camera doar unei pagini https, așa că pentru ea deschide `https://<ip-ul-pi>:8443`. Certificatul e făcut de program (`data/https_*.pem`), deci prima dată Chrome spune „not private”: **Advanced → Proceed**, apoi „Permite” la cameră.
 
 Prima instalare:
 
@@ -35,24 +36,28 @@ sudo apt install -y python3-opencv python3-numpy python3-smbus i2c-tools
 
 - **Fluxul camerei** (15 cadre/s), cu desenul ultimei detecții peste el:
   - caroiajul găsit și colțurile lui (roșii, le poți trage cu mouse-ul);
+  - caroiajul văzut doar parțial (un colț în imagine): punctat portocaliu, cu o săgeată spre centrul lui;
   - cuburile găsite, cu chenar colorat.
+- Eticheta caroiajului arată starea lui: **găsit**, **urmărit** (cu încrederea), **acoperit** (liniile sub cuburi), **parțial**, **NEGĂSIT**. Un caroiaj care dispare din imagine nu mai rămâne desenat.
 - **Detecție**: caroiajul 3×3 pe cadrul curent și varianta **stabilă** (votul pe ultimele cadre). Sarcinile folosesc varianta stabilă.
 - **Sarcina 1 / Sarcina 2**: setările fiecăreia, butoanele Rulează / Stop / Continuă și jurnalul.
 - **Setări**: glisoare care se văd imediat pe imagine. „Salvează” le scrie în `data/settings.json`.
 - Click pe imagine afișează valorile HSV ale punctului. Butonul „Învață” lărgește intervalul unei culori ca să cuprindă punctul ales.
+- **Lumina**: bifa „foaia adusă la alb” (implicit pornită) face culorile, și verdele închis, recunoscute în lumină slabă sau colorată. „Auto-expune pe hârtie” fixează expunerea camerei, ca brațul să nu schimbe culorile când mută camera.
 - **Îngheață** oprește imaginea pe un cadru, ca să reglezi pe aceeași imagine.
 - **Reset** oprește sarcina, șterge memoria și jurnalul.
 - **Braț**: desenul brațului (lateral și de sus) din ultimele unghiuri trimise și Sarcina 1 în două butoane:
-  1. **Sarcina 1: găsește și memorează** (sau Select pe controller): se uită drept în față (poziția `SEARCH` dacă e învățată, altfel înălțimea din `LOOK_S` cu baza la 90°) și caută caroiajul **cu cuburi**; îl centrează, salvează unghiurile ca `LOOK_S` / `LOOK_D` și memorează cuburile → notificare (în pagină și pe ecranul plăcii de răcire). Apoi stă.
-  2. Cuburile se iau de pe caroiaj (oricâte, unul câte unul), apoi **Pune cuburile înapoi**: se uită la caroiaj ce lipsește față de memorie (cuburile rămase nu le atinge), caută cuburile stânga / dreapta, se așază cu camera exact deasupra fiecăruia, rotește încheietura după el, îl prinde și îl pune în celula memorată (întâi rândul din `S1_ROW_ORDER`); la final verifică caroiajul față de cel memorat. Detalii: [dofbot/pick.py](dofbot/pick.py). Butonul poate fi apăsat de mai multe ori; „Reset” șterge memoria.
-- **Învață prinderea (aproape / departe)**: cu un singur cub pus unde ai învățat `PICK_NEAR_jos` (sau `PICK_FAR_jos`), brațul ține minte unde se vede cubul la scanare și de deasupra lui → `data/pick.json`.
+  1. **Sarcina 1: găsește și memorează** (sau Select pe controller): se uită drept în față (poziția `SEARCH` dacă e învățată, altfel înălțimea din `LOOK_S` cu baza la 90°) și caută caroiajul **cu cuburi** alternând stânga / dreapta; îl centrează, salvează unghiurile ca `LOOK_S` / `LOOK_D` și memorează cuburile → notificare (în pagină și pe ecranul plăcii de răcire). Apoi stă.
+  2. Cuburile se iau de pe caroiaj (oricâte, unul câte unul), apoi **Pune cuburile înapoi**: se uită la caroiaj ce lipsește față de memorie (cuburile rămase nu le atinge), caută cuburile în jur, le ia una câte una și le pune în celulele goale ([dofbot/fetch.py](dofbot/fetch.py)), apoi verifică. Se poate apăsa de mai multe ori; „Reset” șterge memoria.
 - **Controllerul USB** e citit de pagină: cât timp nu rulează nimic, muți brațul din el (butoanele din [tools/gamepad.py](tools/gamepad.py)); Select pornește căutarea caroiajului. **În timpul unei sarcini sau căutări, orice buton sau stick o oprește pe loc** și brațul îngheață unde a ajuns. Nu porniți în paralel `tools/gamepad.py`.
 - Pe Pi, coolerul și ecranul plăcii de răcire pornesc odată cu pagina (IP, temperatură, procesor, memorie).
-- **Salvează poze** scrie în `captures/`.
+- **Salvează poze** scrie în `captures/`. **Înregistrează 10 cadre** salvează poze brute pentru reglajul detecției fără braț (vezi [tests/README.md](tests/README.md)).
+- Sursa **Braț simulat (cameră pe gripper)**: ce ar vedea camera de pe braț, din unghiurile brațului simulat. Mută brațul din controller sau pornește Sarcina 1 (cele două butoane) și vezi cum își caută și centrează caroiajul, fără braț.
+- Brațul se mișcă lin: pornește și oprește fără smucituri, iar Stop îl oprește pe loc (în ≤ 25 ms).
 
 ## Pași până la concurs
 
-1. Pe Pi: `python3 tools/calibrate_arm.py` – înveți pozițiile brațului (vezi [tools/README.md](tools/README.md)), inclusiv cele 4 de prindere `PICK_NEAR_*` / `PICK_FAR_*`; apoi, în pagină, „Învață prinderea” aproape și departe.
+1. Pe Pi: `python3 tools/calibrate_arm.py` – înveți pozițiile brațului (vezi [tools/README.md](tools/README.md)).
 2. Pornești pagina și verifici că ambele caroiaje sunt găsite (S și D).
 3. Reglezi culorile la lumina din sală (click pe cub, apoi „Învață”) și apeși „Salvează”.
 4. Rulezi fiecare sarcină din pagină, întâi cu „Pauză între faze” bifată.

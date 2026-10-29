@@ -3,3 +3,4 @@ __pycache__/
 captures/
 raport_windows.txt
 .venv/
+data/https_*.pem

@@ -19,12 +19,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))) 
 
 from dofbot import config as C  # noqa: E402
 from dofbot.arm_driver import get_arm  # noqa: E402
-from dofbot.pick import REQUIRED as PICK_REQUIRED  # noqa: E402
 from dofbot.robot import REQUIRED, load_positions  # noqa: E402
 
 KEYS = {"q": (0, 1), "a": (0, -1), "w": (1, 1), "s": (1, -1), "e": (2, 1),
         "d": (2, -1), "r": (3, 1), "f": (3, -1), "t": (4, 1), "g": (4, -1)}
-LIMITS = [(0, 180), (0, 180), (0, 180), (0, 180), (0, 270)]
+LIMITS = C.LIMITS
 
 try:
     import msvcrt   # Windows
@@ -87,7 +86,7 @@ def main():
             else:
                 print("Nu există.")
         elif k == "n":
-            missing = [n for n in REQUIRED + PICK_REQUIRED if n not in pos]
+            missing = [n for n in REQUIRED if n not in pos]
             print(f"\nLipsesc ({len(missing)}): {' '.join(missing)}")
         elif k in ("x", "\x03"):
             print("\nGata.")

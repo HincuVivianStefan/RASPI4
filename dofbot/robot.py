@@ -1,7 +1,9 @@
 import json
+import math
 import time
 
 from . import config as C
+from . import kinematics
 from .arm_driver import get_arm
 from .sim_world import WORLD
 
@@ -14,6 +16,32 @@ REQUIRED = ["HOME", "LOOK_S", "LOOK_D"] + [
 
 class Stopped(Exception):
     """Sarcina a fost oprită (butonul Stop / Reset)."""
+
+
+LIMIT_SLACK = 5   # grade: o poziție cerută cu atât peste limite e o greșeală (calibrare / calcul), nu o rotunjire
+
+
+def limit(angles):
+    """Unghiurile servo1..5 aduse în LIMITS. Ridică ValueError dacă unul e mult în afară."""
+    out = []
+    for i, (a, (lo, hi)) in enumerate(zip(angles, C.LIMITS)):
+        a = float(a)
+        if not lo - LIMIT_SLACK <= a <= hi + LIMIT_SLACK:
+            raise ValueError(f"servo {i + 1}: {a:.1f}° e în afara limitelor {lo}–{hi}")
+        out.append(min(hi, max(lo, a)))
+    return out
+
+
+def min_jerk(s):
+    """Cât din drum (0..1) la momentul s (0..1): pornește și se oprește cu viteză și accelerație zero."""
+    return s * s * s * (10 - 15 * s + 6 * s * s)
+
+
+def duration(dist, t):
+    """Secunde pentru o mișcare de `dist` grade (cea mai lungă articulație): cel puțin t (unitatea Arm_Lib), dar
+    nu mai repede decât V_MAX și A_MAX (la minimum-jerk, viteza maximă = 1,875 × dist / T, accelerația ≈ 5,77 ×
+    dist / T²)."""
+    return max(t * C.TIME_UNIT_S, 1.875 * dist / C.V_MAX, math.sqrt(5.77 * dist / C.A_MAX))
 
 
 def load_positions():
@@ -30,6 +58,7 @@ class Robot:
         time.sleep(0.1)
         self.pos = load_positions()
         self.grip = C.GRIP_OPEN
+        self.last = None    # ultimele unghiuri trimise (servo1..5): de aici pornește următoarea mișcare
         self.should_stop = should_stop or (lambda: False)
         self.on_look = on_look or (lambda grid: None)
 
@@ -63,8 +92,9 @@ class Robot:
 
     def freeze(self):
         """Oprește brațul unde a ajuns: citește unghiurile din mers și i le trimite înapoi."""
-        a = [int(round(x)) for x in self.current()]
-        self.arm.Arm_serial_servo_write6(a[0], a[1], a[2], a[3], a[4], self.grip, 300)
+        a = self.current()
+        self._send(a, 300)
+        self.last = a
 
     def _get(self, name):
         if name in self.pos:
@@ -77,11 +107,45 @@ class Robot:
         raise KeyError(f"Poziția '{name}' nu e calibrată (rulează calibrate_arm.py)")
 
     def move(self, angles, t=C.T_TRAVEL):
-        """angles = [s1..s5]; gripperul rămâne cum e."""
+        """angles = [s1..s5]; gripperul rămâne cum e. Lin: puncte intermediare trimise la MOTION_HZ, cu profil
+        minimum-jerk (fără smucitură la pornire și oprire), toate articulațiile ajung odată. Durata = t (unitatea
+        Arm_Lib), dar nu mai repede decât permit V_MAX / A_MAX. Stop îl oprește la următorul punct (≤ 25 ms)."""
         self.check()
-        a = [int(round(x)) for x in angles]
-        self.arm.Arm_serial_servo_write6(a[0], a[1], a[2], a[3], a[4], self.grip, t)
-        self._wait(t)
+        target = limit(angles)
+        start = self.last or self.current()
+        dist = max(abs(b - a) for a, b in zip(start, target))
+        n = max(1, math.ceil(duration(dist, t) * C.MOTION_HZ))
+        step_ms = int(2000 / C.MOTION_HZ)      # fiecare punct: atins în două perioade, ca mișcarea să nu stea
+        t0 = time.time()
+        for k in range(1, n + 1):
+            self.check()
+            s = min_jerk(k / n)
+            self._send([a + (b - a) * s for a, b in zip(start, target)], step_ms)
+            if not self.sim or C.SIM_TIME_SCALE:
+                wait = t0 + k / C.MOTION_HZ * (C.SIM_TIME_SCALE if self.sim else 1) - time.time()
+                if wait > 0:
+                    time.sleep(wait)
+        self.last = target
+        if self.sim and C.SIM_VERBOSE:
+            print(f"  [SIM] servo1-5 -> {[round(a, 1) for a in target]}  ({n} puncte)")
+        self.settle(target)
+
+    def _send(self, angles, ms):
+        a = [round(float(x), 1) for x in angles]   # Arm_Lib primește și zecimale (~0,08° pe pas)
+        self.arm.Arm_serial_servo_write6(a[0], a[1], a[2], a[3], a[4], self.grip, ms)
+
+    def settle(self, target):
+        """Așteaptă să ajungă brațul (servourile citite la SETTLE_TOL de țintă, cel mult SETTLE_MAX_S), apoi SETTLE_S.
+        Pe brațul simulat, doar SETTLE_S."""
+        if not self.sim:
+            end = time.time() + C.SETTLE_MAX_S
+            while time.time() < end:
+                self.check()
+                got = [self.arm.Arm_serial_servo_read(i + 1) for i in range(5)]
+                if all(g is None or abs(g - a) <= C.SETTLE_TOL for g, a in zip(got, target)):
+                    break
+                time.sleep(0.02)
+        self.sleep(C.SETTLE_S)
 
     def goto(self, name, t=C.T_TRAVEL):
         if self.sim and C.SIM_VERBOSE:
@@ -120,16 +184,25 @@ class Robot:
             print(f"  [SIM] atenție: nu era niciun cub de luat în {cell}")
         self.goto(f"{cell}_sus", C.T_DESCEND)
 
-    def pick_pose(self, sus, jos, what=None):
-        """Prinde un cub de oriunde (nu dintr-o celulă): sus = deasupra lui, jos = în jurul lui.
-        what = culoarea, pentru lumea simulată."""
+    def grab_at(self, above, down):
+        """Ia un cub de oriunde de pe masă (nu dintr-o celulă): above / down = unghiurile calculate de fetch.py.
+        Întoarce True dacă cubul e în gripper."""
         self.gripper(C.GRIP_OPEN)
-        self.move(sus)
-        self.move(jos, C.T_DESCEND)
+        self.move(above)
+        self.move(down, C.T_DESCEND)
         self.gripper(C.GRIP_CLOSE)
-        if self.sim and what is not None:
-            WORLD.hold(what)
-        self.move(sus, C.T_DESCEND)
+        if self.sim:
+            WORLD.pick_at(*kinematics.grip(down))
+        held = self.holding()
+        self.move(above, C.T_DESCEND)
+        return held
+
+    def holding(self):
+        """E un cub în gripper? Pe brațul real: servo 6 s-a oprit înainte de GRIP_CLOSE (cubul îl ține)."""
+        if self.sim:
+            return WORLD.held is not None
+        a = self.arm.Arm_serial_servo_read(6)
+        return a is None or a < C.GRIP_CLOSE - C.FETCH_EMPTY_TOL
 
     def place(self, cell, level=1):
         self.goto(f"{cell}_sus")
