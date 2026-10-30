@@ -232,12 +232,15 @@ class Robot:
         return held
 
     def place_at(self, above, down, cell=None):
-        """Pune cubul din gripper oriunde pe masă: above / down = unghiurile calculate de fetch.py."""
+        """Pune cubul din gripper oriunde pe masă: above / down = unghiurile calculate de fetch.py; cell = celula
+        caroiajului, dacă acolo îl pune (None = pe masă, de ex. pe locul de îndreptare)."""
         self.move(above)
         self.move(down, C.T_DESCEND)
         self.gripper(C.GRIP_OPEN)
         if self.sim and cell:
             WORLD.place(cell)
+        elif self.sim:
+            WORLD.drop_at(*kinematics.grip(down))
         self.move(above, C.T_DESCEND)
 
     def holding(self):

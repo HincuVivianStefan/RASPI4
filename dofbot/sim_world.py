@@ -28,7 +28,6 @@ DEAD_ZONES = ((30.0, 70.0), (-50.0, -28.0))
 DEAD_DIST = (0.15, 0.21)
 NEAREST, FARTHEST = 0.125, 0.25   # m: brațul ajunge la cuburile dintre atâția metri de bază
 PICK_TOL = 0.012    # m: cât de departe de centrul cubului poate ajunge gripperul ca să-l prindă
-PICK_ANGLE = 25     # grade: cât de strâmb față de fețele cubului se pot închide degetele
 
 
 class SimWorld:
@@ -108,8 +107,9 @@ class SimWorld:
             return packed
 
     def pick_at(self, point, closing):
-        """Gripperul se închide în `point` (m), degetele pe direcția `closing`: ia cubul de pe masă dacă e prins
-        bine (centrul aproape și degetele pe fețe). Întoarce culoarea sau None."""
+        """Gripperul se închide în `point` (m), degetele pe direcția `closing`: ia cubul de pe masă dacă centrul e
+        aproape. Degetele închise strâmb față de fețe îl rotesc până stă drept între ele, ca pe brațul real.
+        Întoarce culoarea sau None."""
         side = synth.SIDE * CELL_M
         with self.lock:
             if self.held is not None or not 0 < point[2] < side:
@@ -117,12 +117,19 @@ class SimWorld:
             best = min(self.table, key=lambda o: np.hypot(o["x"] - point[0], o["y"] - point[1]), default=None)
             if best is None or np.hypot(best["x"] - point[0], best["y"] - point[1]) > PICK_TOL:
                 return None
-            ang = np.degrees(np.arctan2(closing[1], closing[0])) - best["yaw"]
-            if abs((ang + 45) % 90 - 45) > PICK_ANGLE:
-                return None
             self.table.remove(best)
             self.held = best["color"]
             return self.held
+
+    def drop_at(self, point, closing):
+        """Lasă cubul din gripper pe masă în `point` (m), cu fețele pe direcția degetelor `closing`."""
+        with self.lock:
+            if self.held is None:
+                return None
+            color, self.held = self.held, None
+            self.table.append({"x": float(point[0]), "y": float(point[1]),
+                               "yaw": float(np.degrees(np.arctan2(closing[1], closing[0]))), "color": color})
+            return color
 
     def snapshot(self, grid=None):
         """(culoarea de sus, înălțimea) pentru fiecare celulă a caroiajului."""

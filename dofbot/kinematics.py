@@ -66,6 +66,14 @@ def grip(angles):
     return w + C.GRIP_LEN * d + C.GRIP_UP * up + C.GRIP_SIDE * side(angles) + [0, 0, C.GRIP_DZ], right
 
 
+def fingers(angles):
+    """(direcția în care se închid degetele, văzută pe masă, grade; cât de înclinată e față de orizontală, grade).
+    Cu gripperul vertical, servo 5 rotește doar direcția; cu gripperul înclinat, o și apleacă: cubul prins / lăsat
+    cu axa degetelor aplecată iese cu baza strâmbă."""
+    _, right = grip(angles)
+    return float(np.degrees(np.arctan2(right[1], right[0]))), float(np.degrees(np.arcsin(min(1.0, abs(right[2])))))
+
+
 def direction(base, pitch):
     """Direcția gripperului pentru baza `base` și înclinarea `pitch` (grade; 180 = vertical în jos)."""
     b, t = np.radians(base - 90), np.radians(pitch)
@@ -103,16 +111,18 @@ def ik(point, pitch, roll=90.0):
     return [float(a) for a in angles]
 
 
-def reach(point, lift=0.0, roll=90.0):
+def reach(point, lift=0.0, roll=90.0, pitches=None):
     """(unghiurile de prindere, cele de deasupra = cu `lift` m înapoi de-a lungul gripperului, înclinarea): gripperul
     cât mai aproape de înclinarea de la calibrare (GRIP_PITCH, acolo valorile GRIP_* sunt bune), altfel cât mai
-    vertical, de la 180° în jos până la FETCH_MIN_PITCH. None dacă nu ajunge deloc."""
+    vertical, de la 180° în jos până la FETCH_MIN_PITCH. pitches = doar aceste înclinări, în ordine. None dacă nu
+    ajunge deloc."""
     point = np.float64(point)
     base = 90 + np.degrees(np.arctan2(point[1], point[0]))
-    pitches = range(180, C.FETCH_MIN_PITCH - 1, -5)
-    if C.GRIP_PITCH:
+    if pitches is None and C.GRIP_PITCH:
         want = C.GRIP_PITCH[0] + C.GRIP_PITCH[1] * np.hypot(*point[:2])
         pitches = sorted(range(180, C.FETCH_MIN_PITCH - 11, -1), key=lambda p: abs(p - want))
+    elif pitches is None:
+        pitches = range(180, C.FETCH_MIN_PITCH - 1, -5)
     for pitch in pitches:
         down = ik(point, pitch, roll)
         up = ik(point - lift * direction(base, pitch), pitch, roll) if down else None

@@ -7,15 +7,21 @@ mort”) sunt căutate, luate unul câte unul și puse înapoi în celulele memo
 2. Alegerea: un cub de o culoare care mai trebuie pusă, cel cu cel mai mult loc liber în jur (cuburile pot fi
    lipite); degetele se închid pe direcția pe care au mai mult loc.
 3. Prinderea: direct din poziția văzută la căutare (de acolo cubul se vede întreg; de aproape iese din imagine):
-   servo 5 rotește gripperul după cub; deasupra lui, coboară, prinde, urcă. Cu LOOK_CLOSE, camera se duce întâi
-   deasupra cubului și îi corectează poziția (approach).
+   deasupra lui, coboară, prinde, urcă. Cu LOOK_CLOSE, camera se duce întâi deasupra cubului și îi corectează
+   poziția (approach).
+   Servo 5: cu gripperul înclinat, răsucirea nu doar rotește degetele, le și apleacă, iar cubul prins / lăsat cu
+   degetele aplecate iese cu baza strâmbă. De aceea servo 5 se răsucește doar cât axa degetelor rămâne aproape
+   orizontală (GRAB_TILT, calculat din cinematică: plan()). Dacă așa degetele nu ajung pe fețele cubului, cubul
+   e luat cu servo 5 drept (fălcile îl îndreaptă între ele) și dus pe locul de îndreptare, lângă bază, unde
+   gripperul e aproape vertical: lăsat jos, privit de sus și luat din nou cu degetele pe fețele lui (straighten).
 5. Verificarea: după punere, camera se uită la celulă; pe același cadru găsește și liniile caroiajului (grid_here),
    deci măsoară cubul față de celula adevărată (greșeala modelului, diferită de la o poziție la alta, se anulează).
    Dacă e mai departe de PLACE_TOL de centru sau rotit mai mult de PLACE_YAW, e luat și pus din nou, corectat
    (corecția rămâne și pentru cuburile următoare: greșelile sunt aceleași).
 4. Plasarea: în celula memorată. Din pozițiile învățate (Robot.place) dacă există; altfel calculată: centrul celulei
-   din colțurile caroiajului pe masă (văzute la memorare), cinematica inversă ca la prindere, gripperul rotit după
-   laturile caroiajului (Fetcher.place).
+   din colțurile caroiajului pe masă (văzute la memorare), cinematica inversă ca la prindere, degetele cât mai pe
+   laturile caroiajului fără să se aplece peste GRAB_TILT (Fetcher.place; pe rândurile departe de bază cubul
+   poate rămâne rotit câteva grade, dar cu baza dreaptă).
 
 Pe brațul real, greșelile constante (lungimea gripperului, camera montată puțin altfel) se corectează din config:
 GRIP_LEN, FETCH_OFFSET, FETCH_ROLL_SIGN.
@@ -47,10 +53,24 @@ PLACE_TOL = 0.006       # m: cubul pus mai departe de atât de centrul celulei e
 PLACE_TRIES = 2         # de câte ori, cel mult, se reface o punere
 PLACE_YAW = 10          # grade: cubul rotit mai mult de atât față de caroiaj e pus din nou (o dată)
 GRID_SHIFT = 0.03       # m: caroiajul văzut la verificare poate fi atât de departe de cel memorat (altfel e altceva)
-GRAB_DZ = 0.005         # m: prinde cu atât deasupra mijlocului cubului (calibrarea gripperului e bună la ~1 cm: să nu
-                        # intre în masă)
+GRAB_DZ = 0.015         # m: prinde cu atât deasupra mijlocului cubului (calibrarea gripperului e bună la ~1 cm: să nu
+                        # intre în masă; cu 0,5 cm apăsa în masă)                                     # REGLEAZĂ
 LOOK_CLOSE = False      # înainte de prindere, camera se duce deasupra cubului să-i corecteze poziția (pe brațul real
                         # cubul iese din imagine de aproape: îl luăm direct de unde l-a văzut la căutare)
+GRAB_TILT = 4           # grade: cât de aplecată poate fi axa degetelor la prindere / punere (peste: baza cubului strâmbă)
+TILT_COST = 2           # plan(): un grad de aplecare a degetelor cântărește cât atâtea grade de cub rotit
+PITCH_COST = 0.5        # plan(): și un grad de gripper mai înclinat / mai drept decât la calibrare (în afara ei
+                        # modelul greșește înălțimea: gripperul apăsa în masă la 158–166°, calibrat la 109–137°)
+GRAB_YAW_TOL = 10       # grade: degetele rotite mai mult de atât față de fețele cubului = prins strâmb → îndreptare
+FINGER_ROOM = 1.6       # laturi de cub: atâta loc trebuie pe direcția degetelor, ca să încapă lângă un cub vecin
+STAGE = True            # cubul care nu poate fi prins drept e îndreptat pe locul de lângă bază (straighten)
+GRAB_REACH = -0.008     # m: prinde cu atât mai departe de bază decât centrul văzut al cubului (negativ = mai spre
+                        # braț: cu 0 prindea de colțul exterior, cu +0,008 pe lângă cub)              # REGLEAZĂ
+STAGE_R = 0.16          # m de bază: locul de îndreptare (gripperul până la ~160°; la 12,5 cm cubul ajungea prea
+                        # aproape de bază ca să-l mai poată lua)
+STAGE_BASES = (140, 40, 150, 30, 130, 50)   # unde poate fi, în ordine (baza; departe de caroiaj, în stânga / dreapta)
+STAGE_TILT = 10         # grade: pe locul de îndreptare gripperul e aproape vertical, servo 5 se poate răsuci mai mult
+STAGE_CLEAR = 2.0       # laturi de cub: locul de îndreptare e liber dacă niciun alt cub nu e mai aproape de atât
 
 
 def to_table(angles, pts, size, z):
@@ -125,6 +145,7 @@ class Fetcher:
         self.sheet = []    # cadrele căutării, micșorate, cu cuburile marcate (planșa din captures/)
         self.look = None   # unghiurile din care se vede caroiajul (restore): de aici se verifică punerea
         self.fix = np.zeros(2)   # m: cât greșește punerea (măsurat după puneri), scăzut din țintele următoare
+        self.expect = 0.0        # grade: cât de rotit față de caroiaj iese cubul la ultima punere (plan)
 
     def on_grid(self, xy):
         if self.grid is None:
@@ -215,10 +236,9 @@ class Fetcher:
         return min((np.hypot(*np.subtract(o["xy"], cube["xy"])) for o in cubes if o is not cube), default=1.0)
 
     @staticmethod
-    def roll(cube, cubes, pitch):
-        """Rotația gripperului (grade față de servo 5 = 90): degetele pe fețele cubului, pe direcția cu mai mult
-        loc. Cu gripperul înclinat, degetele rămân aproape orizontale (rotația cea mai mică)."""
-        theta = np.degrees(np.arctan2(cube["xy"][1], cube["xy"][0]))
+    def axes(cube, cubes):
+        """Cele două direcții (grade pe masă) pe care se pot închide degetele pe fețele cubului, fiecare cu locul
+        liber de pe ea până la cel mai apropiat vecin din cale (m)."""
         options = []
         for axis in (cube["yaw"], cube["yaw"] + 90):
             u = np.array([np.cos(np.radians(axis)), np.sin(np.radians(axis))])
@@ -229,18 +249,50 @@ class Fetcher:
                 v = np.subtract(o["xy"], cube["xy"])
                 if abs(v @ [-u[1], u[0]]) < 1.1 * C.FETCH_CUBE_M:    # vecinul e în calea degetelor
                     clear = min(clear, abs(v @ u))
-            options.append((clear, wrap(axis - theta, 180)))
-        if pitch < 165:
-            return min((r for _, r in options), key=abs)
-        return max(options, key=lambda o: (round(o[0], 3), -abs(o[1])))[1]
+            options.append((clear, axis))
+        return options
 
-    def poses(self, xy, roll=0.0, dz=0.0):
-        """(prindere, deasupra, înclinarea) pentru un cub cu centrul în xy (ridicat cu dz), sau None dacă nu ajunge."""
+    def poses(self, xy, roll=0.0, dz=0.0, pitch=None):
+        """(prindere, deasupra, înclinarea) pentru un cub cu centrul în xy (ridicat cu dz), sau None dacă nu ajunge.
+        pitch = doar cu această înclinare a gripperului (altfel: cea aleasă de kinematics.reach)."""
         xy = np.float64(xy)
         u = xy / max(np.linalg.norm(xy), 1e-9)
         xy = xy + C.FETCH_OFFSET[0] * u + C.FETCH_OFFSET[1] * np.array([-u[1], u[0]])
         return kinematics.reach([xy[0], xy[1], C.FETCH_CUBE_M / 2 + dz], C.FETCH_LIFT,
-                                90 + C.FETCH_ROLL_SIGN * roll)
+                                90 + C.FETCH_ROLL_SIGN * roll, None if pitch is None else [pitch])
+
+    def plan(self, xy, want=None, dz=0.0, max_tilt=GRAB_TILT, period=90):
+        """Prinderea / punerea unui cub cu centrul în xy: (jos, deasupra, înclinarea gripperului, rotația, abaterea).
+        Degetele cât mai pe direcția `want` (grade pe masă, modulo `period`; None = servo 5 drept), cu axa lor
+        aplecată cel mult max_tilt grade (altfel cubul e ținut aplecat și iese cu baza strâmbă): cu gripperul
+        vertical servo 5 le poate roti oricât, cu gripperul înclinat doar puțin. Se alege cea mai mică abatere +
+        TILT_COST × aplecarea (aplecarea strâmbă baza, abaterea doar rotește cubul) + PITCH_COST × depărtarea de
+        înclinarea aleasă de reach (calibrarea e bună acolo). abaterea = cu câte grade rămân degetele rotite față
+        de `want`. None dacă nu ajunge."""
+        first = self.poses(xy, 0.0, dz)
+        if first is None:
+            return None
+        if want is None:
+            return (*first, 0.0, 0.0)
+        best = None
+        for pitch in [first[2]] + [p for p in range(180, C.FETCH_MIN_PITCH - 11, -2) if p != first[2]]:
+            sol = first if pitch == first[2] else self.poses(xy, 0.0, dz, pitch)
+            if sol is None:
+                continue
+            a = list(sol[0])
+            for sign in (1, -1):
+                for k in range(0 if sign > 0 else 1, 46):     # aplecarea crește cu rotația: ne oprim la max_tilt
+                    a[4] = 90 + C.FETCH_ROLL_SIGN * sign * k
+                    yaw, tilt = kinematics.fingers(a)
+                    if tilt > max_tilt:
+                        break
+                    err = abs(wrap(yaw - want, period))
+                    cost = err + TILT_COST * tilt + PITCH_COST * abs(pitch - first[2])
+                    if best is None or cost < best[0]:
+                        best = (cost, pitch, sign * k, err)
+        _, pitch, roll, err = best          # servo 5 drept are axa degetelor orizontală: există mereu o soluție
+        down, above, pitch = self.poses(xy, roll, dz, pitch)
+        return down, above, pitch, float(roll), float(err)
 
     def approach(self, cube):
         """Privește cubul de deasupra și îi corectează poziția până nu se mai schimbă. Întoarce cubul văzut de
@@ -273,37 +325,136 @@ class Fetcher:
                 break
         return cur
 
+    def grab_plan(self, cube, cubes, max_tilt=GRAB_TILT):
+        """plan() pentru prinderea cubului: degetele pe una dintre cele două perechi de fețe; întâi una pe care au loc
+        lângă vecini (FINGER_ROOM), apoi cea la care ajung mai drept."""
+        best = None
+        for clear, axis in self.axes(cube, cubes):
+            p = self.plan(self.grab_xy(cube["xy"]), axis, GRAB_DZ, max_tilt, period=180)
+            if p is None:
+                return None
+            key = (clear < FINGER_ROOM * C.FETCH_CUBE_M, round(p[4] / 2), -clear)
+            if best is None or key < best[0]:
+                best = (key, p)
+        return best[1]
+
+    @staticmethod
+    def grab_xy(xy):
+        """Unde se închid / se deschid degetele pentru cubul cu centrul (văzut, sau dorit la punere) în xy: cu
+        GRAB_REACH mai departe de bază. Cubul stă în gripper tot cu atât mai încolo, deci și punerea ține cont."""
+        xy = np.float64(xy)
+        return xy + GRAB_REACH * xy / max(np.linalg.norm(xy), 1e-9)
+
+    def grab(self, cube, sol, what="iau"):
+        """Ia cubul cu unghiurile sol = plan(). True dacă e în gripper."""
+        down, above, pitch, roll, err = sol
+        self.log(f"  {what} {cube['color']} de la {np.round(cube['xy'], 3).tolist()} m "
+                 f"(gripper la {pitch}°, servo 5 rotit {roll:+.0f}°, degetele la {err:.0f}° de fețele lui)")
+        if self.rob.grab_at(above, down):
+            return True
+        # Servo 6 zice „gol”, dar pe cubul din set gripperul se închide aproape cât gol: ne uităm cu camera.
+        if not self.rob.sim and cube.get("pose") and not self.still_there(cube):
+            self.log(f"  {cube['color']}: nu mai e pe masă, deci e în gripper")
+            return True
+        # Nici servo 6, nici camera (poate vede cubul chiar din gripper) nu sunt sigure: dacă totuși e în gripper,
+        # îl lasă jos exact de unde l-a luat, ca să nu-l plimbe.
+        self.log(f"  {cube['color']}: nu l-am prins; îl las jos la loc, în caz că totuși e în gripper")
+        self.rob.place_at(above, down)
+        return False
+
     def fetch(self, cube, cubes):
-        """Ia cubul: (apropiere, dacă LOOK_CLOSE), rotația degetelor, coborâre, prindere. True dacă e în gripper."""
+        """Ia cubul: (apropiere, dacă LOOK_CLOSE), degetele pe fețele lui fără să le aplece; dacă nu se poate, cu
+        servo 5 drept, apoi îndreptat pe locul de lângă bază (straighten). True dacă e în gripper."""
         close = self.approach(cube) if LOOK_CLOSE else cube
         if close is None:
             return False
-        sol = self.poses(close["xy"], dz=GRAB_DZ)
+        others = [o for o in cubes if o is not cube]
+        sol = self.grab_plan(close, [close] + others)
         if sol is None:
             self.log(f"  {cube['color']} la {np.round(close['xy'], 3).tolist()} m: nu ajung la el")
             self.far.append(close["xy"])
             return False
-        roll = self.roll(close, [close] + [o for o in cubes if o is not cube], sol[2])
-        sol = self.poses(close["xy"], roll, GRAB_DZ)
-        if sol is None:
-            self.log(f"  {cube['color']}: nu ajung la el cu gripperul rotit")
+        crooked = STAGE and sol[4] > GRAB_YAW_TOL
+        if crooked:
+            self.log(f"  {cube['color']}: degetele ar rămâne la {sol[4]:.0f}° de fețele lui; îl iau cu servo 5 "
+                     "drept și îl îndrept lângă bază")
+            sol = self.plan(self.grab_xy(close["xy"]), None, GRAB_DZ)
+        if sol is None or not self.grab(close, sol):
             return False
-        down, above, pitch = sol
-        self.log(f"  iau {cube['color']} de la {np.round(close['xy'], 3).tolist()} m "
-                 f"(gripper la {pitch}°, rotit {roll:+.0f}°)")
-        if self.rob.grab_at(above, down):
+        return self.straighten(cube["color"], others) if crooked else True
+
+    def stage_spot(self, cubes):
+        """Locul de îndreptare (m): la STAGE_R de bază, departe de caroiaj și de celelalte cuburi, unde ajunge
+        gripperul. None dacă nu e niciunul liber."""
+        a = C.FETCH_CUBE_M
+        for b in STAGE_BASES:
+            t = np.radians(b - 90)
+            xy = STAGE_R * np.array([np.cos(t), np.sin(t)])
+            if self.grid is not None and cv2.pointPolygonTest(
+                    self.grid * 1000, (float(xy[0]) * 1000, float(xy[1]) * 1000), True) > -1.5 * a * 1000:
+                continue
+            if any(np.hypot(*np.subtract(o["xy"], xy)) < STAGE_CLEAR * a for o in cubes):
+                continue
+            if any(np.hypot(*np.subtract(f, xy)) < STAGE_CLEAR * a for f in self.far):
+                continue
+            if self.plan(xy, None, PLACE_DZ) is not None:
+                return xy
+        return None
+
+    def look_down(self, xy, color):
+        """Cubul de culoarea `color` din jurul lui xy (m), privit cât mai de sus (de unde îi vede bine rotația), sau
+        None dacă nu-l vede."""
+        from .aim import project
+        top = [xy[0], xy[1], C.FETCH_CUBE_M]
+        views = [a for a in (kinematics.look_at(top, d) for d in VIEW_DIST[::-1]) if a]
+        if self.look is not None:       # și ca la căutare, cu baza spre el: întâi de unde cade mai aproape de mijloc
+            rows = []
+            for d in (0, SCAN_NEAR, 2 * SCAN_NEAR):
+                p = list(self.look)
+                p[0] = 90 + np.degrees(np.arctan2(xy[1], xy[0]))
+                p[1] = min(max(p[1] + d, C.LIMITS[1][0]), C.LIMITS[1][1])
+                q = project(p, np.float64([top]), (C.CAM_W, C.CAM_H))
+                if q is not None and np.abs(q[0] - 0.5).max() < 0.4:
+                    rows.append((float(np.abs(q[0] - 0.5).max()), p))
+            views += [p for _, p in sorted(rows)]
+        for pose in views:
+            seen = [c for c in self.view(pose, grid_too=True) if c["color"] == color
+                    and np.hypot(*np.subtract(c["xy"], xy)) < 2 * LOST]
+            if seen:
+                return min(seen, key=lambda c: np.hypot(*np.subtract(c["xy"], xy)))
+        return None
+
+    def straighten(self, color, cubes):
+        """Cubul din gripper, prins cu servo 5 drept: îl lasă pe locul de îndreptare (lângă bază, gripperul aproape
+        vertical, deci servo 5 îl poate răsuci fără să-l aplece), se uită la el de sus și îl ia din nou cu degetele pe
+        fețele lui. True dacă e iar în gripper."""
+        spot = self.stage_spot(cubes)
+        if spot is None:
+            self.log("  nu am loc liber pentru îndreptare: îl duc cum l-am prins")
             return True
-        # Servo 6 zice „gol”, dar pe cubul din set gripperul se închide aproape cât gol: ne uităm cu camera.
-        if not self.rob.sim and close.get("pose") and not self.still_there(close):
-            self.log(f"  {cube['color']}: nu mai e pe masă, deci e în gripper")
-            return True
-        self.log(f"  {cube['color']}: nu l-am prins")
-        return False
+        down, above, pitch, _, _ = self.plan(self.grab_xy(spot), None, PLACE_DZ)
+        self.log(f"  îl las pe locul de îndreptare, la {np.round(spot, 3).tolist()} m (gripper la {pitch}°)")
+        self.rob.place_at(above, down)
+        cube = self.look_down(spot, color)
+        if cube is None:
+            self.log(f"  {color}: nu-l văd pe locul de îndreptare; îl iau cum l-am lăsat")
+            cube = {"color": color, "xy": list(spot), "yaw": kinematics.fingers(down)[0]}
+        sol = self.grab_plan(cube, [cube] + cubes, STAGE_TILT)
+        if sol is None:         # văzut puțin mai încolo, unde nu ajunge: îl ia de unde l-a lăsat (acolo ajunge sigur)
+            self.log(f"  {color}: îl văd la {np.round(cube['xy'], 3).tolist()} m, unde nu ajung; îl iau de unde l-am lăsat")
+            cube = dict(cube, xy=list(spot))
+            sol = self.grab_plan(cube, [cube] + cubes, STAGE_TILT)
+        if sol is None:
+            self.log(f"  {color}: nu mai ajung la el pe locul de îndreptare")
+            self.far.append(cube["xy"])
+            return False
+        return self.grab(cube, sol, "îl iau din nou:")
 
     def still_there(self, cube):
-        """Cubul e tot pe masă, unde era sau împins puțin (privit de unde fusese văzut la căutare)?"""
+        """Cubul e tot pe masă, unde era sau împins puțin (privit de unde fusese văzut la căutare)? Doar în jurul
+        lui (SAME laturi): un alt cub de aceeași culoare din celula vecină (~5 cm) nu e el."""
         seen = [c for c in self.view(cube["pose"], grid_too=True) if c["color"] == cube["color"]]
-        return any(np.hypot(*np.subtract(c["xy"], cube["xy"])) < 2 * LOST for c in seen)
+        return any(np.hypot(*np.subtract(c["xy"], cube["xy"])) < SAME * C.FETCH_CUBE_M for c in seen)
 
     def cell_xy(self, r, c, grid=None):
         """Centrul celulei (r, c), 0..2, pe masă (m): din colțurile caroiajului (implicit cel memorat; stânga-sus,
@@ -318,14 +469,13 @@ class Fetcher:
         xy = self.cell_xy(int(cell[1]) - 1, int(cell[2]) - 1) - self.fix
         tl, tr = np.float64(self.grid[:2])
         edge = np.degrees(np.arctan2(*(tr - tl)[::-1]))        # direcția rândurilor pe masă
-        theta = np.degrees(np.arctan2(xy[1], xy[0]))
-        roll = wrap(edge - theta)                              # degetele pe laturile caroiajului, rotația cea mai mică
-        sol = self.poses(xy, roll, PLACE_DZ)
+        sol = self.plan(self.grab_xy(xy), edge, PLACE_DZ)      # degetele pe laturile caroiajului, cât nu se apleacă
         if sol is None:
             self.log(f"  {cell}: nu ajung la celulă ({np.round(xy, 3).tolist()} m)")
             return False
-        down, above, pitch = sol
-        self.log(f"  pun în {cell} la {np.round(xy, 3).tolist()} m (gripper la {pitch}°, rotit {roll:+.0f}°)")
+        down, above, pitch, roll, self.expect = sol
+        self.log(f"  pun în {cell} la {np.round(xy, 3).tolist()} m (gripper la {pitch}°, servo 5 rotit {roll:+.0f}°"
+                 f", cubul iese rotit ~{self.expect:.0f}° față de caroiaj)")
         self.rob.place_at(above, down, cell)
         return True
 
@@ -421,8 +571,8 @@ class Fetcher:
             self.log(f"  {cell}: cubul e la {np.hypot(*off) * 100:.1f} cm de centru ({off[0] * 100:+.1f}, "
                      f"{off[1] * 100:+.1f} cm), rotit {yaw:+.0f}° față de caroiaj"
                      + ("" if grid is not None else " (liniile nu le văd: față de caroiajul memorat)"))
-            if np.hypot(*off) <= PLACE_TOL and abs(yaw) <= PLACE_YAW:
-                return True
+            if np.hypot(*off) <= PLACE_TOL and abs(yaw) <= PLACE_YAW + self.expect:
+                return True             # rotit cât era de așteptat (mai drept nu-l poate pune fără să-l aplece)
             if np.hypot(*off) <= PLACE_TOL and last_yaw is not None:
                 return True             # rotit, dar deja repus o dată pentru rotație: mai mult n-ar ajuta
             last_yaw = yaw
