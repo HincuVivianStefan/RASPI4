@@ -40,22 +40,30 @@ def wrist(angles):
     return r * axis + np.array([0, 0, z]), d, up
 
 
+def _rolled(angles, roll):
+    """(încheietura, direcția gripperului, dreapta, sus) cu imaginea rotită cu `roll` grade."""
+    w, d, up = wrist(angles)
+    r = np.radians(roll)
+    right = np.cross(d, up)
+    right, up = np.cos(r) * right + np.sin(r) * up, np.cos(r) * up - np.sin(r) * right
+    return w, d, right, up
+
+
 def camera_pose(angles):
     """(poziția camerei, R) cu R = rândurile [dreapta, jos, înainte] ale camerei, în sistemul brațului
-    (deci un punct X se vede în coordonatele camerei ca R @ (X - poziția)). Servo 5 rotește imaginea."""
-    w, d, up = wrist(angles)
-    roll = np.radians((angles[4] if len(angles) > 4 else 90) - 90)
-    right = np.cross(d, up)
-    right, up = np.cos(roll) * right + np.sin(roll) * up, np.cos(roll) * up - np.sin(roll) * right
+    (deci un punct X se vede în coordonatele camerei ca R @ (X - poziția)). Cu CAM_ROLLS, servo 5 rotește imaginea
+    (camera pe partea care se rotește); pe brațul nostru camera e înainte de rotație (măsurat: servo 5 nu o mișcă)."""
+    roll = ((angles[4] if len(angles) > 4 else 90) - 90) if C.CAM_ROLLS else 0.0
+    w, d, right, up = _rolled(angles, roll)
     pos = w + CAM_ALONG * d + CAM_UP * up
     return pos, np.vstack([right, -up, d])
 
 
 def grip(angles):
-    """(punctul dintre degetele gripperului, direcția în care se închid degetele = „dreapta” camerei)."""
-    w, d, _ = wrist(angles)
-    _, R = camera_pose(angles)
-    return w + C.GRIP_LEN * d, R[0]
+    """(punctul dintre degetele gripperului, direcția în care se închid degetele; servo 5 le rotește)."""
+    w, d, up = wrist(angles)
+    _, _, right, _ = _rolled(angles, C.FETCH_ROLL_SIGN * ((angles[4] if len(angles) > 4 else 90) - 90))
+    return w + C.GRIP_LEN * d + C.GRIP_UP * up + C.GRIP_SIDE * side(angles) + [0, 0, C.GRIP_DZ], right
 
 
 def direction(base, pitch):
@@ -64,14 +72,25 @@ def direction(base, pitch):
     return np.array([np.sin(t) * np.cos(b), np.sin(t) * np.sin(b), np.cos(t)])
 
 
+def side(angles):
+    """Direcția orizontală „dreapta” a brațului (și a camerei: e perpendiculară pe planul brațului)."""
+    b = np.radians(angles[0] - 90)
+    return np.array([np.sin(b), -np.cos(b), 0.0])
+
+
 def ik(point, pitch, roll=90.0):
     """Unghiurile servo1..5 care duc punctul gripperului în `point` (m), cu gripperul înclinat `pitch` grade față de
     vertical în sus (180 = drept în jos). None dacă nu ajunge sau iese din limite."""
     x, y, z = point
     base = 90 + np.degrees(np.arctan2(y, x))
+    for _ in range(4):      # punctul de prindere e la GRIP_SIDE în afara planului brațului: planul trece pe lângă punct
+        x, y = np.subtract(point[:2], C.GRIP_SIDE * side([base])[:2])
+        base = 90 + np.degrees(np.arctan2(y, x))
     t4 = np.radians(pitch)
     r = np.hypot(x, y)
-    px, pz = r - C.GRIP_LEN * np.sin(t4), z - C.GRIP_LEN * np.cos(t4) - BASE_H   # încheietura, față de umăr
+    # încheietura, față de umăr: punctul de prindere e la GRIP_LEN pe gripper și GRIP_UP în afara axei lui
+    px = r - C.GRIP_LEN * np.sin(t4) + C.GRIP_UP * np.cos(t4)
+    pz = z - C.GRIP_DZ - C.GRIP_LEN * np.cos(t4) - C.GRIP_UP * np.sin(t4) - BASE_H
     D = (px * px + pz * pz - L1 * L1 - L2 * L2) / (2 * L1 * L2)
     if abs(D) > 1:
         return None
@@ -85,11 +104,16 @@ def ik(point, pitch, roll=90.0):
 
 
 def reach(point, lift=0.0, roll=90.0):
-    """(unghiurile de prindere, cele de deasupra = cu `lift` m înapoi de-a lungul gripperului, înclinarea): cel mai
-    vertical gripper cu care ajunge, de la 180° în jos până la FETCH_MIN_PITCH. None dacă nu ajunge deloc."""
+    """(unghiurile de prindere, cele de deasupra = cu `lift` m înapoi de-a lungul gripperului, înclinarea): gripperul
+    cât mai aproape de înclinarea de la calibrare (GRIP_PITCH, acolo valorile GRIP_* sunt bune), altfel cât mai
+    vertical, de la 180° în jos până la FETCH_MIN_PITCH. None dacă nu ajunge deloc."""
     point = np.float64(point)
     base = 90 + np.degrees(np.arctan2(point[1], point[0]))
-    for pitch in range(180, C.FETCH_MIN_PITCH - 1, -5):
+    pitches = range(180, C.FETCH_MIN_PITCH - 1, -5)
+    if C.GRIP_PITCH:
+        want = C.GRIP_PITCH[0] + C.GRIP_PITCH[1] * np.hypot(*point[:2])
+        pitches = sorted(range(180, C.FETCH_MIN_PITCH - 11, -1), key=lambda p: abs(p - want))
+    for pitch in pitches:
         down = ik(point, pitch, roll)
         up = ik(point - lift * direction(base, pitch), pitch, roll) if down else None
         if up:

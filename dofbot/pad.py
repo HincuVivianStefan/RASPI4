@@ -3,7 +3,8 @@
 - Cât timp nu rulează nimic automat, muți brațul din controller (ca tools/gamepad.py).
 - OPRIRE DE URGENȚĂ: în timpul unei sarcini sau al căutării caroiajului, orice buton, stick sau D-pad
   o oprește pe loc și brațul îngheață unde a ajuns. Controlul manual revine după ce lași totul liber.
-- Select (9) pornește Pasul 1 (caută caroiajul, salvează unghiurile, memorează cuburile); Start (10) doar oprește (nu iese, ca în gamepad.py).
+- Select (9) pornește Pasul 1 (caută caroiajul, salvează unghiurile, memorează cuburile); stick stâng apăsat (11) duce
+  brațul în poziția sigură (ca butonul din pagină); Start (10) doar oprește (nu iese, ca în gamepad.py).
 Fără pygame sau fără controller, pagina merge normal (doar fără toate acestea).
 """
 import os
@@ -180,13 +181,12 @@ class Pad:
                     except ValueError:
                         pass
                     hold = True     # butonul încă e apăsat: să nu oprească imediat căutarea pornită
-                elif b == MAP["home"]:
-                    home = load_positions().get("HOME")
-                    if home:
-                        angles = [float(a) for a in home]
-                        self.arm.Arm_serial_servo_write6(*angles, round(grip), 1000)
-                        time.sleep(1000 * C.TIME_UNIT_S)
-                        vel, sent = [0.0] * 5, None
+                elif b == MAP["home"]:      # poziția sigură, ca butonul din pagină (oprită de orice buton)
+                    try:
+                        self.runner.start("safe")
+                    except ValueError:
+                        pass
+                    hold = True
             if hold:
                 continue
             if hat:

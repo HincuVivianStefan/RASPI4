@@ -45,7 +45,8 @@ sudo apt install -y python3-opencv python3-numpy python3-smbus i2c-tools
 - Click pe imagine afișează valorile HSV ale punctului. Butonul „Învață” lărgește intervalul unei culori ca să cuprindă punctul ales.
 - **Lumina**: bifa „foaia adusă la alb” (implicit pornită) face culorile, și verdele închis, recunoscute în lumină slabă sau colorată. „Auto-expune pe hârtie” fixează expunerea camerei, ca brațul să nu schimbe culorile când mută camera.
 - **Îngheață** oprește imaginea pe un cadru, ca să reglezi pe aceeași imagine.
-- **Reset** oprește sarcina, șterge memoria și jurnalul.
+- **Reset** oprește sarcina, șterge memoria și jurnalul, apoi duce brațul în poziția sigură.
+- **Poziție sigură** (secțiunea Braț, sau stick-ul stâng apăsat pe controller; și automat la pornirea paginii, `SAFE_ON_START`): brațul ca cifra 2, de unde începe căutarea caroiajului (`SEARCH` dacă e învățată, altfel înălțimea din `LOOK_S` cu baza în față, altfel `SAFE_POSE`). Întâi ridică brațul cu baza pe loc, apoi rotește baza; gripperul rămâne cum e. Se oprește din STOP sau din controller.
 - **Braț**: desenul brațului (lateral și de sus) din ultimele unghiuri trimise și Sarcina 1 în două butoane:
   1. **Sarcina 1: găsește și memorează** (sau Select pe controller): se uită drept în față (poziția `SEARCH` dacă e învățată, altfel înălțimea din `LOOK_S` cu baza la 90°) și caută caroiajul **cu cuburi** alternând stânga / dreapta; îl centrează, salvează unghiurile ca `LOOK_S` / `LOOK_D` și memorează cuburile → notificare (în pagină și pe ecranul plăcii de răcire). Apoi stă.
   2. Cuburile se iau de pe caroiaj (oricâte, unul câte unul), apoi **Pune cuburile înapoi**: se uită la caroiaj ce lipsește față de memorie (cuburile rămase nu le atinge), caută cuburile în jur, le ia una câte una și le pune în celulele goale ([dofbot/fetch.py](dofbot/fetch.py)), apoi verifică. Se poate apăsa de mai multe ori; „Reset” șterge memoria.

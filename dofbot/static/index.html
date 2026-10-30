@@ -257,6 +257,7 @@
         <div class="row">
           <button class="primary" id="aim" onclick="post('aim')" title="privește în față și mișcă umărul / cotul / încheietura până vede caroiajul cu cuburi; salvează unghiurile (LOOK_S / LOOK_D) și memorează cuburile">Sarcina 1: găsește și memorează</button>
           <button class="primary" id="rebuild" onclick="post('rebuild')" title="după ce au fost luate cuburile: se uită ce lipsește de pe caroiaj, caută cuburile stânga / dreapta și le pune în celulele memorate">Pune cuburile înapoi</button>
+          <button id="safe" onclick="post('safe')" title="brațul ca cifra 2, gata de căutat caroiajul (SEARCH, altfel înălțimea din LOOK_S, cu baza în față); întâi ridică brațul, apoi rotește baza">Poziție sigură</button>
           <button class="danger" id="estop" onclick="post('stop')">STOP</button>
           <span class="muted">sau orice buton de pe controller</span>
         </div>
@@ -266,6 +267,22 @@
           <div style="max-width:170px"><div class="muted">Memorat</div><div class="g3" id="mem2"></div></div>
         </div>
         <div class="muted" id="arminfo"></div>
+        <details id="gripcal">
+          <summary>Calibrare gripper (unde prinde de fapt)</summary>
+          <div class="muted">1. Pune un cub pe masă în fața brațului, la 15–25 cm de bază → „Găsește cubul”.
+            2. Prinde-l din controller: degetele pe două fețe opuse, centrat, cubul rămâne pe masă.
+            3. „Salvează prinderea”. Repetă în 4–6 locuri diferite: neapărat și aproape (~13 cm) și departe (~22 cm) de
+            bază, plus stânga / dreapta, apoi
+            „Calculează și aplică”.</div>
+          <div class="row">
+            <button id="gc-find" onclick="post('grip_find')">Găsește cubul</button>
+            <button id="gc-save" onclick="post('grip_save')">Salvează prinderea</button>
+            <button class="primary" id="gc-fit" onclick="post('grip_fit')">Calculează și aplică</button>
+            <button onclick="if (confirm('Ștergi toate măsurătorile gripperului?')) post('grip_clear')">Șterge tot</button>
+          </div>
+          <div class="muted" id="gc-info"></div>
+          <div id="gc-list"></div>
+        </details>
       </div>
     </div>
 
@@ -472,11 +489,12 @@ function render() {
   $("b-src").textContent = s.camera_error ? "imagine: " + s.camera_error : "imagine OK";
   $("b-src").className = "badge " + (s.camera_error ? "bad" : "ok");
   $("b-arm").textContent = "braț: " + (s.sim ? "simulat" : "REAL"); $("b-arm").className = "badge " + (s.sim ? "warn" : "ok");
-  // găsit / urmărit (verificat pe cadrul ăsta, cu încrederea) / acoperit (liniile sub cuburi) / parțial / manual / pierdut
+  // găsit / urmărit (verificat pe cadrul ăsta, cu încrederea) / acoperit (liniile sub cuburi) / aproximat (iese parțial,
+  // dar se văd toate cele 9 celule: culorile se citesc) / parțial / manual / pierdut
   const gs = v.corners ? (v.grid_status || (v.corner_src === "auto" ? "găsit" : "manual")) : "pierdut";
   const conf = v.grid_conf != null ? ` ${Math.round(v.grid_conf * 100)}%` : "";
   $("b-grid").textContent = `caroiaj ${v.grid}: ${gs === "pierdut" ? "NEGĂSIT" : gs + conf}`;
-  $("b-grid").className = "badge " + ({"pierdut": "bad", "parțial": "warn", "manual": "warn"}[gs] || "ok");
+  $("b-grid").className = "badge " + ({"pierdut": "bad", "parțial": "warn", "aproximat": "warn", "manual": "warn"}[gs] || "ok");
   $("b-task").textContent = "sarcină: " + t.status + (t.name ? ` (${t.name})` : "");
   $("b-task").className = "badge " + ({"rulează": "ok", "pauză": "warn", "eroare": "bad"}[t.status] || "");
   $("b-ms").textContent = `flux ${v.stream_fps ?? "–"} cadre/s · detecție ${v.ms ?? "–"} ms`;
@@ -552,7 +570,7 @@ function render() {
   // Braț: simulare + controller
   const arm = s.arm || {}, pad = arm.pad || {};
   const busy = t.status === "rulează" || t.status === "pauză";
-  $("aim").disabled = busy; $("estop").disabled = !busy;
+  $("aim").disabled = busy; $("safe").disabled = busy; $("estop").disabled = !busy;
   $("rebuild").disabled = busy || !s.memorized;
   $("b-pad").textContent = "controller: " + (pad.status || "–");
   $("b-pad").className = "badge " + (/OPRIT/.test(pad.status) ? "bad" : /automat|manual/.test(pad.status) ? "ok" : "warn");
@@ -562,6 +580,23 @@ function render() {
   $("notice").innerHTML = nt ? `<div class="pause">🔔 ${nt.text}</div>` : "";
   if (nt && nt.id !== noticeId) { if (noticeId !== null) toast(nt.text); noticeId = nt.id; }
   if (!nt && noticeId === null) noticeId = 0;
+  // Calibrarea gripperului
+  const gc = s.grip || {samples: [], params: {}};
+  $("gc-find").disabled = busy; $("gc-save").disabled = busy || !gc.cube; $("gc-fit").disabled = busy || !gc.samples.length;
+  const gp = gc.params;
+  $("gc-info").textContent = (gc.cube ? `Cub găsit: ${gc.cube.color} la (${(gc.cube.xy[0] * 100).toFixed(1)}, ${(gc.cube.xy[1] * 100).toFixed(1)}) cm — prinde-l și salvează. `
+    : "") + `Acum: GRIP_LEN ${gp.GRIP_LEN} cm, GRIP_UP ${gp.GRIP_UP} cm, GRIP_SIDE ${gp.GRIP_SIDE} cm, GRIP_DZ ${gp.GRIP_DZ} cm.`;
+  const gkey = JSON.stringify(gc.samples);
+  if (gkey !== $("gc-list").dataset.k) {
+    $("gc-list").dataset.k = gkey;
+    $("gc-list").innerHTML = gc.samples.length ? "<table class='colors'><tr><th>#</th><th>cub</th><th>unde (cm)</th>"
+      + "<th>unghiuri</th><th>greșeala modelului acum (x, y, z cm)</th><th></th></tr>" + gc.samples.map((m, i) =>
+        `<tr><td>${i + 1}</td><td>${m.color}</td><td>${m.xy.join(", ")}</td><td>${m.angles.map(Math.round).join(" ")}</td>`
+        + `<td>${m.err.map(v => (v > 0 ? "+" : "") + v).join(", ")}</td>`
+        + `<td><button onclick="post('grip_delete', {i: ${i}})">șterge</button></td></tr>`).join("") + "</table>"
+      : "<div class='muted'>Nicio măsurătoare încă.</div>";
+  }
+
   const key = JSON.stringify(arm.angles);
   if (key !== armKey) {
     armKey = key;

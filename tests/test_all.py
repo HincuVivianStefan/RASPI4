@@ -364,7 +364,8 @@ class TestArmCamera(unittest.TestCase):
         self.assertIsNone(vision.find_partial_grid(synth.render([[None] * 3 for _ in range(3)], paper=False)))
 
     def test_aim_from_corner(self):
-        """Brațul vede doar un colț al caroiajului: se mută până îl vede întreg, centrat. A doua oară pornește
+        """Brațul vede doar un colț al caroiajului: se mută până îl vede întreg, la mijloc, cu linia
+        de jos aproape de marginea de jos a imaginii. A doua oară pornește
         cu efectul articulațiilor ținut minte (data/aim.json), fără mișcări de probă."""
         from dofbot import aim
         old = aim.JACOBIAN_FILE
@@ -380,7 +381,9 @@ class TestArmCamera(unittest.TestCase):
                 self.assertIsNotNone(final, f"de la {start}")
                 t = np.float32(sim_world.true_corners("S", final)) / [640, 480]
                 self.assertTrue(((t > 0.02) & (t < 0.98)).all(), f"de la {start}: caroiajul nu e întreg în imagine")
-                self.assertLess(np.abs(t.mean(0) - 0.5).max(), 0.12)
+                self.assertLess(abs(t[:, 0].mean() - 0.5), 0.12, f"de la {start}: nu e la mijloc")
+                bottom = np.sort(t[:, 1])[-2:].mean()
+                self.assertLess(abs(bottom - aim.BOTTOM_Y), 0.08, f"de la {start}: linia de jos la {bottom:.2f}")
             self.assertTrue(os.path.exists(aim.JACOBIAN_FILE))
         finally:
             aim.JACOBIAN_FILE = old

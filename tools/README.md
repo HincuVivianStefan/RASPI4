@@ -18,7 +18,7 @@ care dă imagine. Dacă niciuna nu merge, afișează ce trebuie verificat (permi
 python3 tools/calibrate_arm.py
 ```
 
-Muți brațul din tastatură și salvezi fiecare poziție în `data/positions.json`:
+La pornire duce brațul în poziția sigură (ca butonul din pagină). Apoi muți brațul din tastatură și salvezi fiecare poziție în `data/positions.json`:
 
 | Taste | Ce mișcă |
 |---|---|

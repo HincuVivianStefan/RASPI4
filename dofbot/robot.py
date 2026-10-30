@@ -2,6 +2,7 @@ import json
 import math
 import time
 
+from . import aim
 from . import config as C
 from . import kinematics
 from .arm_driver import get_arm
@@ -76,19 +77,52 @@ class Robot:
     def _wait(self, t):
         self.sleep(t * C.TIME_UNIT_S + C.SETTLE_S)
 
-    def current(self):
-        """Unghiurile servo1..5 citite de pe braț (o citire ratată se reîncearcă; altfel HOME sau 90)."""
-        home = self.pos.get("HOME", [90, 90, 90, 90, 90])
+    def read(self, ids=range(1, 6)):
+        """Unghiurile citite de pe braț (o citire ratată se reîncearcă); None unde nu s-a putut citi."""
         angles = []
-        for i in range(5):
+        for sid in ids:
             a = None
             for _ in range(3):
-                a = self.arm.Arm_serial_servo_read(i + 1)
+                a = self.arm.Arm_serial_servo_read(sid)
                 if a is not None:
                     break
                 time.sleep(0.03)
-            angles.append(float(a if a is not None else home[i]))
+            angles.append(None if a is None else float(a))
         return angles
+
+    def current(self):
+        """Unghiurile servo1..5 citite de pe braț (o citire ratată: HOME sau 90)."""
+        home = self.pos.get("HOME", [90, 90, 90, 90, 90])
+        return [float(h if a is None else a) for a, h in zip(self.read(), home)]
+
+    def search_pose(self, grid="S"):
+        """De unde începe căutarea caroiajului: SEARCH (dacă e învățată), altfel înălțimea din LOOK_<caroiaj>
+        (sau SAFE_POSE), cu baza drept în față."""
+        if "SEARCH" in self.pos:
+            return list(self.pos["SEARCH"])
+        pose = list(self.pos.get(f"LOOK_{grid}") or C.SAFE_POSE)
+        pose[0] = aim.SEARCH_CENTER
+        return pose
+
+    def safe(self):
+        """Poziția sigură = search_pose(): brațul ca cifra 2, gata de căutat caroiajul. Întâi ridică umărul / cotul / încheietura cu
+        baza pe loc (să nu măture cuburile), apoi rotește baza. Gripperul rămâne cum e (poate ține un cub).
+        Un servo care nu poate fi citit (de ex. trecut de capătul cursei) e adus încet, dintr-o comandă, nu printr-un salt."""
+        self.check()
+        target = limit(self.search_pose())
+        grip = self.read([6])[0]
+        if grip is not None:
+            self.grip = round(grip)
+        got = self.read()
+        if None in got:
+            self._send(target, C.SAFE_SLOW_MS)
+            self.last = target
+            self.sleep(C.SAFE_SLOW_MS * C.TIME_UNIT_S)
+            self.settle(target)
+            return
+        self.last = limit(got)
+        self.move([got[0]] + target[1:4] + [got[4]])
+        self.move(target)
 
     def freeze(self):
         """Oprește brațul unde a ajuns: citește unghiurile din mers și i le trimite înapoi."""
@@ -196,6 +230,15 @@ class Robot:
         held = self.holding()
         self.move(above, C.T_DESCEND)
         return held
+
+    def place_at(self, above, down, cell=None):
+        """Pune cubul din gripper oriunde pe masă: above / down = unghiurile calculate de fetch.py."""
+        self.move(above)
+        self.move(down, C.T_DESCEND)
+        self.gripper(C.GRIP_OPEN)
+        if self.sim and cell:
+            WORLD.place(cell)
+        self.move(above, C.T_DESCEND)
 
     def holding(self):
         """E un cub în gripper? Pe brațul real: servo 6 s-a oprit înainte de GRIP_CLOSE (cubul îl ține)."""

@@ -18,8 +18,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))   # rădăcina proiectului
 
 from dofbot import config as C  # noqa: E402
-from dofbot.arm_driver import get_arm  # noqa: E402
-from dofbot.robot import REQUIRED, load_positions  # noqa: E402
+from dofbot.robot import REQUIRED, Robot  # noqa: E402
 
 KEYS = {"q": (0, 1), "a": (0, -1), "w": (1, 1), "s": (1, -1), "e": (2, 1),
         "d": (2, -1), "r": (3, 1), "f": (3, -1), "t": (4, 1), "g": (4, -1)}
@@ -46,12 +45,13 @@ except ImportError:  # Linux (Pi)
 
 def main():
     C.SIM_VERBOSE = False   # aici linia de stare arată deja unghiurile
-    arm, sim = get_arm()
-    pos = load_positions()
-    angles = list(pos.get("HOME", [90, 90, 90, 90, 90]))
-    grip = C.GRIP_OPEN
+    rob = Robot()
+    print("Duc brațul în poziția sigură (HOME sau SAFE_POSE)...")
+    rob.safe()
+    arm, pos = rob.arm, rob.pos
+    angles = [round(a) for a in rob.last]
+    grip = rob.grip
     step = 2
-    arm.Arm_serial_servo_write6(*angles, grip, 1000)
     print(__doc__)
 
     while True:

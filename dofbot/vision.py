@@ -172,10 +172,10 @@ def paper_color(img):
     h, w = img.shape[:2]
     small = img if w <= 160 else cv2.resize(img, (160, max(1, round(h * 160 / w))), interpolation=cv2.INTER_AREA)
     hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
-    gray = hsv[..., 1] < PAPER_MAX_S
+    v = hsv[..., 2]
+    gray = (hsv[..., 1] < PAPER_MAX_S) & (v > 8)     # negrul pur = fără date (marginile imaginii mari), nu hârtie
     if np.count_nonzero(gray) < 50:
         return None
-    v = hsv[..., 2]
     paper = gray & (v >= np.percentile(v[gray], PAPER_PCT))
     return np.median(small[paper].astype(np.float32), axis=0)
 
@@ -505,14 +505,16 @@ def verify_grid(frame, corners):
 
 
 # ---------- caroiajul văzut doar parțial ----------
-# Brațul vede doar un colț: caroiajul iese din imagine. Îl extrapolăm (colțurile pot fi în afara imaginii) ca să
-# știm încotro să mutăm camera; culorile nu se citesc dintr-un caroiaj parțial.
+# Brațul vede doar o parte: caroiajul iese din imagine. Îl extrapolăm (colțurile pot fi în afara imaginii) din
+# liniile lui (line_candidates) sau din celulele văzute, ca să știm încotro să mutăm camera. Dacă se văd toate cele
+# 9 celule (partial_usable), e „aproximat”: culorile și cuburile se citesc și din el.
 _E = np.concatenate([np.linspace(-0.6, -0.2, 5), np.linspace(3.2, 3.6, 5)])
 _EXT_PTS = np.float32(np.vstack([np.column_stack([np.full_like(_E, k), _E]) for k in range(4)] +
                                 [np.column_stack([_E, np.full_like(_E, k)]) for k in range(4)]))[None]
 PARTIAL_OK = 0.75       # potrivirea minimă pe partea vizibilă
 PARTIAL_MIN_SEEN = 0.2  # cât din linii trebuie să cadă în imagine, neacoperite de cuburi
 PARTIAL_TRIES = 6       # câte ipoteze ajustăm (cele mai promițătoare)
+PARTIAL_USE_MARGIN = 0.02   # caroiajul extrapolat e folosit și pentru culori dacă centrele celor 9 celule sunt în imagine
 
 
 def partial_score(near, mask, corners, cov):
@@ -564,7 +566,7 @@ def find_partial_grid(frame):
     near = cv2.dilate(mask, np.ones((3, 3), np.uint8))
     cubes, _ = find_cubes(frame)
     cov = body_cover(cubes, s, mask.shape)
-    cands = cell_candidates(mask, near)
+    cands = line_candidates(mask) + cell_candidates(mask, near)
     if len(cubes) >= LATTICE_MIN:
         g = grid_from_cubes(frame)      # cuburile, chiar și doar o parte din ele, dau rețeaua
         if g is not None:
@@ -585,6 +587,125 @@ def find_partial_grid(frame):
         if seen >= PARTIAL_MIN_SEEN and sc > best_score and squareish(c):
             best, best_score = c, sc
     return None if best is None else [[x / s, y / s] for x, y in best]
+
+
+LINE_MIN = 0.12    # line_candidates: un segment de linie mai scurt decât atât din lățime nu contează
+LINE_SAME = 5      # px (la GRID_W): segmente pe aceeași dreaptă, la atât una de alta = aceeași linie
+LINE_KEEP = 0.3    # o linie a caroiajului are cel puțin atât din lungimea celei mai lungi din familia ei (restul: muchii
+                   # de cuburi, umbre)
+
+
+def _lines(mask):
+    """Dreptele lungi din masca liniilor negre, unite din segmente: listă de (punct, direcție unitară, lungime)."""
+    w = mask.shape[1]
+    segs = cv2.HoughLinesP(mask, 1, np.pi / 180, 40, minLineLength=LINE_MIN * w, maxLineGap=12)
+    groups = []
+    for x1, y1, x2, y2 in ([] if segs is None else segs[:, 0]):
+        a, b = np.float64([x1, y1]), np.float64([x2, y2])
+        d = (b - a) / max(np.linalg.norm(b - a), 1e-9)
+        for g in groups:
+            p, gd = g["p"], g["d"]
+            n = np.array([-gd[1], gd[0]])
+            if abs(d @ gd) > 0.99 and abs((a - p) @ n) < LINE_SAME and abs((b - p) @ n) < LINE_SAME:
+                g["pts"] += [a, b]
+                g["len"] += np.linalg.norm(b - a)
+                break
+        else:
+            groups.append({"p": a, "d": d, "pts": [a, b], "len": np.linalg.norm(b - a)})
+    out = []
+    for g in groups:
+        vx, vy, x0, y0 = cv2.fitLine(np.float32(g["pts"]), cv2.DIST_L2, 0, 0.01, 0.01).ravel()
+        out.append((np.float64([x0, y0]), np.float64([vx, vy]), g["len"]))
+    return out
+
+
+def _cross(l1, l2):
+    """Intersecția a două drepte (punct, direcție) sau None dacă sunt aproape paralele."""
+    (p, d), (q, e) = l1[:2], l2[:2]
+    m = np.array([d, -e]).T
+    if abs(np.linalg.det(m)) < 1e-6:
+        return None
+    t = np.linalg.solve(m, q - p)
+    return p + t[0] * d
+
+
+def _fourth(ts):
+    """Pozițiile (1D, de-a lungul unei drepte) a 3 linii egal depărtate pe masă, văzute în perspectivă → poziția celei
+    de-a patra, după ultima: omografia 1D t ↦ (a·k + b)/(c·k + 1) prin k = 0, 1, 2, evaluată la k = 3."""
+    A = np.array([[k, 1, -k * t] for k, t in enumerate(ts)], float)
+    try:
+        a, b, c = np.linalg.solve(A, np.float64(ts))
+    except np.linalg.LinAlgError:
+        return None
+    den = 3 * c + 1
+    return None if abs(den) < 1e-6 else (3 * a + b) / den
+
+
+def line_candidates(mask):
+    """Ipoteze de caroiaj (colțuri, la scara măștii) din liniile lui: două familii (cam orizontale / cam verticale),
+    fiecare cu 4 linii văzute sau 3 (a patra calculată din perspectivă, de o parte sau de alta). Merge și când o
+    margine a caroiajului e în afara imaginii, dacă se văd destule linii din el."""
+    lines = _lines(mask)
+    fams = [[l for l in lines if abs(l[1][0]) >= abs(l[1][1])], [l for l in lines if abs(l[1][0]) < abs(l[1][1])]]
+    c = np.float64(mask.shape[::-1]) / 2
+    sets = []
+    for k, fam in enumerate(fams):
+        # ordonate pe direcția perpendiculară (orizontalele de sus în jos, verticalele de la stânga la dreapta)
+        key = (lambda l: _cross(l, (c, np.float64([0, 1])))) if k == 0 else (lambda l: _cross(l, (c, np.float64([1, 0]))))
+        pos = [(key(l), l) for l in fam]
+        pos = sorted([(p[1 - k], l) for p, l in pos if p is not None], key=lambda t: t[0])
+        longest = max((l[2] for _, l in pos), default=0)
+        kept = []
+        for t, l in pos:
+            if l[2] < LINE_KEEP * longest:
+                continue
+            if kept and t - kept[-1][0] < 2 * LINE_SAME:    # aceeași linie, găsită de două ori: rămâne cea mai lungă
+                if l[2] > kept[-1][1][2]:
+                    kept[-1] = (t, l)
+                continue
+            kept.append((t, l))
+        pos = kept
+        opts = []
+        for i in range(len(pos) - 3):
+            opts.append([l for _, l in pos[i:i + 4]])
+        for i in range(len(pos) - 2):
+            three = [l for _, l in pos[i:i + 3]]
+            axis = (c, np.float64([0, 1]) if k == 0 else np.float64([1, 0]))
+            ts = [_cross(l, axis)[1 - k] for l in three]
+            p0, d0 = three[1][:2]
+            for order in (ts, ts[::-1]):        # a patra linie după ultima sau înaintea primei
+                t4 = _fourth(order)
+                if t4 is None:
+                    continue
+                q = c.copy()
+                q[1 - k] = t4
+                new = (q, (three[0][1] + three[2][1]) / 2, 0.0)   # direcția: media vecinilor (aproximativ)
+                opts.append(three + [new] if order is ts else [new] + three)
+        sets.append(opts)
+    cands = []
+    for hs in sets[0]:
+        for vs in sets[1]:
+            pts = [_cross(hs[0], vs[0]), _cross(hs[0], vs[3]), _cross(hs[3], vs[3]), _cross(hs[3], vs[0])]
+            if all(p is not None for p in pts):
+                cands.append([[float(x), float(y)] for x, y in pts])
+    return cands
+
+
+def cells_visible(corners, size):
+    """Ce celule (3x3, bool) se văd destul ca să citim cubul din ele: centrul celulei și o bandă deasupra lui (unde
+    cade fața de sus a cubului văzut oblic) sunt în imagine, la PARTIAL_USE_MARGIN de margine."""
+    w, h = size
+    M = cv2.getPerspectiveTransform(np.float32([[0, 0], [3, 0], [3, 3], [0, 3]]), np.float32(corners))
+    cells = [[c + 0.5, r + dr] for r in range(3) for c in range(3) for dr in (0.5, 0.1)]
+    pts = cv2.perspectiveTransform(np.float32([[p] for p in cells]), M).reshape(-1, 2) / [w, h]
+    m = PARTIAL_USE_MARGIN
+    return ((pts >= m) & (pts <= 1 - m)).all(1).reshape(3, 3, 2).all(2)
+
+
+def partial_usable(corners, size):
+    """Caroiajul extrapolat (ieșit parțial din imagine) e destul ca să citim culorile și cuburile: se văd toate cele
+    9 celule (cells_visible)."""
+    return bool(cells_visible(corners, size).all())
 
 
 def cube_cover(frame, corners, s, shape):

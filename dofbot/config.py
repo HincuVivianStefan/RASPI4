@@ -15,6 +15,7 @@ ROOT = os.path.dirname(HERE)                          # rădăcina proiectului
 DATA_DIR = os.path.join(ROOT, "data")                 # tot ce se calibrează / salvează
 CAPTURES_DIR = os.path.join(ROOT, "captures")         # poze salvate (pagină + depanare sarcini)
 POS_FILE = os.path.join(DATA_DIR, "positions.json")
+MEMORY_FILE = os.path.join(DATA_DIR, "memory.json")   # ce a memorat Sarcina 1 (rămâne și după repornire)
 VISION_FILE = os.path.join(DATA_DIR, "vision.json")
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 
@@ -27,7 +28,7 @@ SIM_START = [90, 112, 15, 1, 90]   # unde stă brațul simulat la pornire (camer
 
 # Gripper (servo 6)                                   # REGLEAZĂ
 GRIP_OPEN = 60
-GRIP_CLOSE = 135
+GRIP_CLOSE = 150   # gripperul gol se închide până la 180; pe cubul din set: 135 nu-l strânge, 165 prea tare (2026-10-30)
 
 # Limitele servourilor 1..5 (bază, umăr, cot, încheietură, rotație), în grade. Arm_Lib ignoră în tăcere
 # o comandă peste 180 (270 la servo 5) și trimite un impuls greșit sub 0, deci le verificăm noi.
@@ -40,6 +41,12 @@ V_MAX = 90          # grade/s, viteza maximă a unei articulații               
 A_MAX = 300         # grade/s², accelerația maximă (mai mic = mai lin, mai lent)   # REGLEAZĂ
 SETTLE_TOL = 2.0    # grade: brațul a ajuns când toate servourile citite sunt atât de aproape de țintă
 SETTLE_MAX_S = 0.6  # cât așteptăm, cel mult, să ajungă (după care mergem mai departe oricum)
+
+# Poziția sigură (butonul din pagină și pornirea paginii) = de unde începe căutarea caroiajului: SEARCH dacă e
+# învățată, altfel înălțimea din LOOK_S cu baza drept în față, altfel SAFE_POSE.
+SAFE_POSE = [90, 112, 15, 1, 90]   # servo1..5: brațul ca cifra 2, camera în jos spre masă, în față  # REGLEAZĂ
+SAFE_ON_START = True               # pe brațul real, pagina îl duce în poziția sigură când pornește
+SAFE_SLOW_MS = 3000                # un servo necitit (de ex. trecut de capătul cursei) e adus încet, într-o comandă
 
 # Timpi de mișcare (unitatea Arm_Lib)                 # REGLEAZĂ
 T_TRAVEL = 900     # între poziții "sus"
@@ -127,6 +134,7 @@ CUBE_TOP = 0.9            # latura părții colorate / latura cubului (marginile
 CUBE_SIDE = 0.0           # latura cubului, în celule (ex. 0.8), ca să recunoască turnurile; 0 = orice pată e un cub
 CAM_FOCAL = 0.0           # focala camerei, în pixeli la CAM_W; 0 = învățată singură din caroiaj
 CAM_FOCAL_GUESS = 1.0     # până e învățată: focala / lățimea imaginii
+CAM_ROLLS = False         # camera se rotește cu servo 5? (pe brațul nostru nu: e prinsă înainte de rotația gripperului)
 
 # Sarcini
 PAUSE_BETWEEN_PHASES = False   # True: după memorare, robotul așteaptă "Continuă" (Enter / buton web)
@@ -136,12 +144,21 @@ S2_ORDER = ["rosu", "galben", "verde", "albastru", "rosu"]   # de JOS în SUS
 
 # Sarcina 1, partea a doua (dofbot/fetch.py): cuburile mutate într-un loc pe care camera nu-l vedea („unghiul
 # mort”) sunt căutate, luate unul câte unul și puse înapoi în celulele memorate.          # REGLEAZĂ pe brațul real
-FETCH_CUBE_M = 0.03       # latura cubului, în metri
-GRIP_LEN = 0.115          # încheietura → punctul dintre degetele gripperului unde ajunge centrul cubului, m
+FETCH_CUBE_M = 0.033      # latura cubului, în metri (cubul din set: 3,3 cm)
+GRIP_LEN = 0.146          # încheietura → punctul dintre degetele gripperului unde ajunge centrul cubului, m (Yahboom FK:
+                          # brațul întins, punctul de prindere la 0,312 m = 2 × 0,08285 + 0,146; măsurat: calibrarea din pagină)
+GRIP_UP = 0.0             # m: punctul de prindere, în afara axei gripperului (spre „sus” al camerei); calibrare
+GRIP_SIDE = 0.0           # m: punctul de prindere, la dreapta camerei (camera montată puțin într-o parte); calibrare
+GRIP_DZ = 0.0             # m: brațul real ajunge cu atât mai sus decât modelul (umărul / servourile); calibrare
+GRIP_PITCH = []           # [a, b]: înclinarea gripperului preferată la distanța r (m) de bază = a + b·r (grade; 180 =
+                          # vertical): cum l-ai ținut la calibrare, unde valorile GRIP_* sunt bune. [] = cât mai vertical
+# GRIP_*: măsurate din pagină (Braț → Calibrare gripper, gripcal.py) și scrise în data/settings.json
 FETCH_LIFT = 0.05         # de unde privește cubul înainte să-l ia: atâția metri înapoi, de-a lungul gripperului
 FETCH_TOL = 0.004         # m: poziția cubului e bună când două priviri de aproape diferă cu mai puțin de atât
-FETCH_OFFSET = [0.0, 0.0] # m, adunat la punctul de prindere (spre cub / la stânga lui), dacă brațul greșește mereu la fel
-FETCH_ROLL_SIGN = 1       # -1 dacă servo 5 rotește gripperul invers decât crede programul (degetele nu se aliniază)
+FETCH_OFFSET = [0.0, 0.0] # m, adunat la punctul de prindere (dinspre bază spre cub / la stânga lui), dacă brațul
+                          # greșește mereu la fel (întâi: calibrarea gripperului din pagină, gripcal.py)
+FETCH_ROLL_SIGN = -1      # servo 5 rotește gripperul invers decât crede modelul (pe brațul nostru: comandat +12°, cubul
+                          # ieșea rotit -34°, 2026-10-30)
 FETCH_MIN_PITCH = 110     # cât de înclinat poate fi gripperul pentru un cub departe (180 = vertical, 90 = orizontal)
 FETCH_EMPTY_TOL = 6       # grade: gripperul închis la mai puțin de atât de GRIP_CLOSE = nu a prins nimic
 
@@ -156,6 +173,7 @@ TUNABLE = ["COLORS", "LIGHT_NORM", "LIGHT_MAX_GAIN", "CAM_EXPOSURE", "CAM_GAIN",
            "GRID_MAX_RATIO",
            "MIN_FRACTION", "PATCH", "STABLE_FRAMES", "CUBE_MODE", "CUBE_MIN_AREA", "CUBE_MAX_AREA",
            "CUBE_MAX_ASPECT", "CUBE_MIN_FILL", "CUBE_3D", "CUBE_TOP", "CUBE_SIDE", "CAM_FOCAL", "PAUSE_BETWEEN_PHASES",
+           "GRIP_LEN", "GRIP_UP", "GRIP_SIDE", "GRIP_DZ", "GRIP_PITCH",
            "S1_ROW_ORDER", "S2_TARGET", "S2_ORDER", "SYNTH_LAYOUT"]
 _DEFAULTS = {k: copy.deepcopy(globals()[k]) for k in TUNABLE}
 
@@ -179,6 +197,11 @@ def _check(key, value):
                     raise ValueError(f"{name}: fiecare limită are 3 valori H, S, V")
                 out[str(name)].append((tuple(lo), tuple(hi)))
         return out
+    if key == "GRIP_PITCH":
+        value = [float(v) for v in value]
+        if len(value) not in (0, 2):
+            raise ValueError("GRIP_PITCH = [] sau [a, b] (înclinarea = a + b·distanța)")
+        return value
     if key == "S1_ROW_ORDER":
         value = [int(v) for v in value]
         if sorted(value) != [1, 2, 3]:

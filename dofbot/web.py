@@ -26,10 +26,12 @@ import numpy as np
 from . import camera
 from . import aim
 from . import fetch
+from . import gripcal
 from . import config as C
 from . import hat
 from . import pad
 from . import overlay
+from . import panorama
 from . import planner
 from . import tasks
 from . import vision
@@ -101,6 +103,7 @@ class Pipeline:
         self.paused = False   # detecția stă (nefolosit acum: căutarea brațului folosește chiar detecția paginii)
         self.done_t = 0.0     # când s-a terminat ultima procesare a unui cadru (căutarea brațului o așteaptă)
         self.urgent = False   # o sarcină așteaptă detecția: cuburile la fiecare cadru, nu doar la CUBE_EVERY
+        self.grid_off = False  # brațul caută / ia cuburi în jur: caroiajul nu se mai caută (doar cuburile se arată)
         self.viewers = {k: 0 for k in STREAMS}
         self.jpeg = {k: None for k in STREAMS}
         self.jseq = {k: 0 for k in STREAMS}
@@ -277,7 +280,9 @@ class Pipeline:
                 self.partial = vision.find_partial_grid(frame)
             self.lines = vision.lines_hint(frame) if self.partial is None else None
             if self.partial is not None:
-                self.grid_status = "parțial"
+                # Se văd toate cele 9 celule: îl folosim și pentru culori / cuburi (aproximat).
+                usable = vision.partial_usable(self.partial, (frame.shape[1], frame.shape[0]))
+                self.grid_status = "aproximat" if usable else "parțial"
 
     def accept(self, found):
         """Colțuri noi găsite automat, netezite cu cele vechi dacă sunt aproape (fără tremur pe imagine)."""
@@ -291,8 +296,13 @@ class Pipeline:
     def process(self, frame):
         t0 = time.time()
         with self.lock:
-            self.track(frame)
+            if self.grid_off:
+                self.corners = self.partial = self.lines = None
+                self.grid_status, self.grid_conf = "oprit (caut cuburi)", None
+            else:
+                self.track(frame)
             corners, src, partial = self.corners, self.corner_src, self.partial
+            approx = corners is None and partial is not None and self.grid_status == "aproximat"
         if not (self.urgent or self.count % C.CUBE_EVERY == 0):
             # Doar caroiajul (urmărește camera); cuburile rămân cele de la ultima detecție.
             self.result = dict(self.result, corners=corners, partial=partial)
@@ -304,11 +314,12 @@ class Pipeline:
             return
         colors = fracs = faces = None
         top = np.zeros((vision.WARP, vision.WARP, 3), np.uint8)
-        if corners:
-            d = vision.detect_full(frame, corners)
+        use = corners or (partial if approx else None)    # caroiajul aproximat: culorile se citesc și din el
+        if use:
+            d = vision.detect_full(frame, use)
             colors, faces, fracs, cubes, rejected = d["colors"], d["faces"], d["fracs"], d["cubes"], d["rejected"]
             if self.viewers["top"]:
-                top = vision.annotate_top(d["top"], colors, fracs, cubes, corners)
+                top = vision.annotate_top(d["top"], colors, fracs, cubes, use)
         else:
             cubes, rejected = vision.find_cubes(frame)   # și fără caroiaj arătăm ce obiecte vedem
         self.result = {"corners": corners, "colors": colors, "cubes": cubes, "rejected": rejected, "partial": partial}
@@ -328,7 +339,7 @@ class Pipeline:
             "corners": corners,
             "cubes": [{k: o.get(k) for k in ("color", "cell", "face", "angle", "area", "aspect")} for o in cubes],
             "rejected": [{k: o[k] for k in ("color", "reason", "area", "aspect", "fill")} for o in rejected],
-            "corner_src": src, "grid": self.grid, "grid_found": corners is not None, "partial": partial,
+            "corner_src": src, "grid": self.grid, "grid_found": use is not None, "partial": partial,
             "grid_status": self.grid_status, "grid_conf": self.grid_conf,
             "frozen": self.frozen is not None, "stream_fps": round(self.stream_fps, 1),
             "ms": round((time.time() - t0) * 1000), "frame_size": [frame.shape[1], frame.shape[0]],
@@ -368,6 +379,25 @@ class Pipeline:
 
 
 # ---------------------------------------------------------------- rularea sarcinilor
+def load_memory():
+    try:
+        with open(C.MEMORY_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, ValueError):
+        return None
+
+
+def save_memory(memory):
+    """Memoria Sarcinii 1 pe disc (None = ștearsă), ca „Pune cuburile înapoi” să meargă și după o repornire."""
+    if memory is None:
+        if os.path.exists(C.MEMORY_FILE):
+            os.remove(C.MEMORY_FILE)
+        return
+    os.makedirs(C.DATA_DIR, exist_ok=True)
+    with open(C.MEMORY_FILE, "w", encoding="utf-8") as f:
+        json.dump(memory, f, indent=2)
+
+
 class Runner:
     def __init__(self, pipeline):
         self.pipeline = pipeline
@@ -375,8 +405,9 @@ class Runner:
         self.stop_ev = threading.Event()
         self.cont_ev = threading.Event()
         self.on_memorize = lambda colors: None   # App: afișează aranjarea memorată de Pasul 1
-        self.memory = None   # ce a memorat Pasul 1 (caroiaj, unghiuri, culori), pentru „Pune cuburile înapoi”
+        self.memory = load_memory()   # ce a memorat Pasul 1 (caroiaj, unghiuri, culori), pentru „Pune cuburile înapoi”
         self.grid_area = None                     # caroiajul pe masă (m), văzut la Pasul 1
+        self.grip_cube = None                     # calibrarea gripperului: cubul găsit, care urmează să fie prins
         self.clear()
 
     def clear(self):
@@ -413,50 +444,97 @@ class Runner:
         self.notice = {"id": time.time(), "text": text}
         hat.message(*(short or [text[:20]]))
 
-    def search_pose(self, rob, grid):
-        """De unde începe căutarea: SEARCH (dacă e învățată), altfel înălțimea din LOOK_<caroiaj> sau
-        cea de acum, cu baza drept în față."""
-        if "SEARCH" in rob.pos:
-            return list(rob.pos["SEARCH"])
-        pose = list(rob.pos.get(f"LOOK_{grid}") or rob.current())
-        pose[0] = aim.SEARCH_CENTER
-        return pose
-
     def step1(self, rob):
         """Pasul 1: privește drept în față, caută caroiajul cu cuburi, ține minte unghiurile de unde îl vede
         (LOOK_<caroiaj>) și memorează cuburile. Apoi Pasul 2."""
         grid = self.pipeline.grid
-        start = self.search_pose(rob, grid)
-        self.log(f"Mă uit drept în față: {[round(a) for a in start]}")
-        rob.move(start, 1500)
-        rob.sleep(0.5)
-        angles = self.aim(rob, center=False)
+        angles = self.aim_line(rob, grid)
         if angles is None:
-            self.notify("Nu am găsit caroiajul cu cuburi.", ["Caroiaj negasit"])
-            raise RuntimeError("Nu am găsit caroiajul")
-        # Găsit, dar poate doar pe jumătate în imagine: ne așezăm să-l vedem tot, apoi memorăm.
-        self.log("L-am găsit. Mă așez să văd tot caroiajul, apoi memorez cuburile.")
-        hat.message("Caroiaj gasit", "Ma asez...")
-        better = self.aim(rob, search=False, center=True)
-        if better is not None:
-            angles = better
-        else:
-            self.log("Nu am reușit să-l văd mai bine; memorez de unde sunt.")
+            self.log("Nu l-am văzut întreg pe traseul liniar: îl caut și în jur (mai încet).")
+            start = rob.search_pose(grid)
+            rob.move(start, 1500)
+            rob.sleep(0.5)
+            angles = self.aim(rob, center=False)
+            if angles is None:
+                self.notify("Nu am găsit caroiajul cu cuburi.", ["Caroiaj negasit"])
+                raise RuntimeError("Nu am găsit caroiajul")
+            self.log("L-am găsit. Mă așez să văd tot caroiajul, apoi memorez cuburile.")
+            hat.message("Caroiaj gasit", "Ma asez...")
+            better = self.aim(rob, search=False, center=True)
+            if better is not None:
+                angles = better
+            else:
+                self.log("Nu am reușit să-l văd mai bine; memorez de unde sunt.")
         rob.sleep(0.5)
         rob.pos[f"LOOK_{grid}"] = angles
         os.makedirs(C.DATA_DIR, exist_ok=True)
         with open(C.POS_FILE, "w", encoding="utf-8") as f:
             json.dump(rob.pos, f, indent=2)
         self.log(f"Caroiaj {grid} găsit. Unghiurile salvate ca LOOK_{grid} = {angles}")
-        seen = self.look()
-        self.grid_area = fetch.grid_area(angles, seen["corners"], seen["size"])   # cuburile de pe el nu se iau
-        colors = self.detect(grid)
+        colors, self.grid_area = self.read_grid(rob, angles, grid)   # grid_area: cuburile de pe el nu se iau
+        if self.grid_area is None:
+            self.log("ATENȚIE: nu am putut duce caroiajul pe masă: nu voi ști unde să pun cuburile.")
+        else:
+            f = fetch.Fetcher(rob, None, self.log, self.grid_area)
+            cm = lambda xy: f"({xy[0] * 100:.0f}, {xy[1] * 100:+.0f}) cm"   # noqa: E731
+            far = [f"{grid}{r + 1}{c + 1}" for r in range(3) for c in range(3) if f.poses(f.cell_xy(r, c)) is None]
+            self.log(f"Caroiajul pe masă (în față, stânga +): rândul 1 la {cm(f.cell_xy(0, 1))}, rândul 3 la "
+                     f"{cm(f.cell_xy(2, 1))}. " + (f"NU AJUNG la {', '.join(far)}: apropiați foaia de braț."
+                                                  if far else "Ajung la toate celulele."))
         self.on_memorize(colors)
         self.publish("source", colors)
         n = sum(c is not None for row in colors for c in row)
         self.log(f"Cuburi memorate:\n{tasks.grid_text(colors)}")
         self.notify(f"Am găsit caroiajul cu cuburi și l-am memorat: {n} cuburi.", ["Caroiaj gasit!", "Memorat: %d cuburi" % n])
         return {"grid": grid, "angles": angles, "colors": colors}
+
+    def grip_find(self, rob):
+        """Calibrarea gripperului, pasul 1: deschide gripperul și găsește cubul din fața brațului (gripcal)."""
+        self.grip_cube = None
+        rob.gripper(C.GRIP_OPEN)
+        self.pipeline.grid_off = True
+        try:
+            cube = gripcal.find_cube(rob, self.frame)
+        finally:
+            self.pipeline.grid_off = False
+        if cube is None:
+            self.notify("Nu văd niciun cub în fața brațului (pune-l la 15–25 cm de bază).", ["Niciun cub"])
+            raise RuntimeError("Nu văd niciun cub")
+        self.grip_cube = cube
+        x, y = cube["xy"]
+        self.notify(f"Văd {cube['color']} la ({x * 100:.1f}, {y * 100:+.1f}) cm. Prinde-l din controller (degetele pe "
+                    "cub, centrat, cubul rămâne pe masă), apoi „Salvează prinderea”.", ["Cub gasit", "prinde-l..."])
+        return cube
+
+    def read_grid(self, rob, angles, grid, table=None):
+        """(culorile 3x3, caroiajul pe masă în m) văzute din `angles`: dintr-o imagine dacă se văd toate celulele,
+        altfel din imaginea mare (stânga / dreapta / sus / jos / diagonale, lipite într-o imagine de sus).
+        table = caroiajul deja găsit (m, pe masă; nu se mută): nu se mai caută, doar se citesc celulele lui."""
+        if table is not None:
+            pano = panorama.build(rob, self.frame, self.log, angles, table=table)
+            if pano is None:
+                raise RuntimeError("Nu pot face imaginea mare")
+            corners, colors = pano.read(table)
+            self.log(f"Imaginea mare: {pano.save(corners)}")
+            return colors, table
+        seen = self.look()
+        size = seen["size"]
+        corners = seen["corners"]
+        # Dintr-o privire doar caroiajul găsit întreg pe liniile lui (nu extrapolat) și cu margine în jur.
+        if (corners is not None and not seen["approx"] and vision.cells_visible(corners, size).all()
+                and aim.quad_metrics(corners, *size)[3] < 0.5):
+            return self.detect(grid), fetch.grid_area(angles, corners, size)
+        self.log("Nu se vede tot caroiajul dintr-o privire: fac o imagine mare din mai multe.")
+        hat.message("Imagine mare", "ma uit in jur...")
+        pano = panorama.build(rob, self.frame, self.log, angles, size)
+        if pano is None:
+            raise RuntimeError("Nu pot face imaginea mare")
+        corners, table, colors = pano.detect()
+        self.log(f"Imaginea mare: {pano.save(corners)}")
+        if colors is None:
+            self.notify("Nici pe imaginea mare nu găsesc caroiajul.", ["Caroiaj negasit"])
+            raise RuntimeError("Nici pe imaginea mare nu găsesc caroiajul")
+        return colors, table
 
     def memorize(self, rob):
         """Butonul „Sarcina 1: găsește și memorează”: Pasul 1, apoi brațul așteaptă butonul „Pune cuburile înapoi”."""
@@ -466,6 +544,7 @@ class Runner:
         if not any(any(row) for row in first["colors"]):
             raise RuntimeError("Nu am memorat niciun cub")
         self.memory = dict(first, grid_area=self.grid_area)
+        save_memory(self.memory)
         self.notify("Aranjarea e memorată. Luați cuburile (oricâte, oricând), apoi apăsați „Pune cuburile înapoi”.",
                     ["Memorat!", "Astept butonul"])
         return first
@@ -484,7 +563,8 @@ class Runner:
         rob.move(look, 1500)
         rob.sleep(0.5)
         try:
-            present = self.detect(grid)
+            present, _ = self.read_grid(rob, look, grid, self.grid_area)
+            self.log(f"Pe caroiaj acum:\n{tasks.grid_text(present)}")
         except RuntimeError:
             self.log("Nu văd caroiajul acum; îl consider gol.")
             present = [[None] * 3 for _ in range(3)]
@@ -497,9 +577,14 @@ class Runner:
     def step3(self, rob, grid, look, memorized, present=None):
         """Pasul 3: caută cuburile în jur, le pune înapoi în celulele memorate, apoi verifică caroiajul."""
         fetcher = fetch.Fetcher(rob, self.frame, self.log, self.grid_area)
-        report = fetch.restore(rob, self, memorized, look, fetcher, grid, present)
+        self.pipeline.grid_off = True       # cât caută / ia cuburi, caroiajul nu se mai caută pe imagine
+        try:
+            report = fetch.restore(rob, self, memorized, look, fetcher, grid, present)
+        finally:
+            self.pipeline.grid_off = False
         rob.move(look, 1500)
-        colors = self.detect(grid)
+        rob.sleep(0.5)
+        colors, _ = self.read_grid(rob, look, grid, self.grid_area)
         self.publish("dest", colors)
         errors = planner.compare(memorized, colors)
         left = [color for _, color in report["missing"]]
@@ -521,12 +606,58 @@ class Runner:
             time.sleep(0.03)
         with p.lock:
             corners = p.corners if p.corner_src == "auto" and p.missed == 0 else None
+            approx = corners is None and p.partial is not None and p.grid_status == "aproximat"
+            if approx:
+                corners = p.partial     # ieșit parțial din imagine, dar se văd toate cele 9 celule
             partial = p.partial if corners is None else None
             lines = p.lines if corners is None and partial is None else None
         cubes = p.result["cubes"]
         h, w = (p.frame.shape[:2] if p.frame is not None else (C.CAM_H, C.CAM_W))
-        return {"corners": corners, "partial": partial, "lines": lines, "cubes": [o["box"] for o in cubes],
+        return {"corners": corners, "approx": approx, "partial": partial, "lines": lines, "cubes": [o["box"] for o in cubes],
                 "cells": sum(1 for o in cubes if o.get("cell")), "size": (w, h)}
+
+    def aim_line(self, rob, grid):
+        """Caroiajul fix în față: întâi de unde l-a văzut ultima dată (LOOK_<caroiaj>), apoi traseul liniar
+        aim.LINE_NEAR → aim.LINE_FAR. Întoarce unghiurile sau None."""
+        p = self.pipeline
+        p.urgent = True
+        try:
+            need = C.GRID_NEED_CUBES if grid == "S" else 0
+            a = aim.Aimer(rob, self.frame, self.log, need_cubes=need, look=self.look)
+            here = rob.current()
+            last = rob.pos.get(f"LOOK_{grid}")
+            near = list(rob.pos.get("LINE_NEAR", aim.LINE_NEAR))[:4] + [here[4]]
+            far = list(rob.pos.get("LINE_FAR", aim.LINE_FAR))[:4] + [here[4]]
+            found = None
+            if last:
+                self.log(f"Mă uit de unde l-am văzut ultima dată: {last}")
+                a.move(list(last), 1000)
+                m, ok = a.grid_now()
+                if ok:
+                    self.log(f"Îl văd de aici (linia de jos la {m[4]:.2f}, mărime {m[2]:.2f}).")
+                    found = [round(v) for v in last]
+            if found is None:
+                found = a.linear(near, far)
+            if found is None:
+                return None
+            o = self.look()
+            corners = o["corners"] if o["corners"] is not None else o.get("partial")
+            if corners is not None and not o.get("approx") and aim.quad_metrics(corners, *o["size"])[3] < 0.5:
+                self.log("Îl încadrez (zoom in / zoom out din braț):")
+                return a.frame(found)
+            # Nu încape întreg într-o imagine: imaginea mare se face din jurul mijlocului lui (de aproape, unde
+            # modelul greșește puțin și privirile se lipesc bine), nu de unde l-a văzut întâmplător.
+            est = fetch.grid_area(found, corners, o["size"]) if corners is not None else None
+            if est is None:
+                return found
+            center = np.mean(est, 0)
+            pose = a.facing(center, near, far)
+            self.log(f"Nu încape întreg într-o imagine; e la ({center[0] * 100:.0f}, {center[1] * 100:+.0f}) cm: "
+                     f"mă uit spre mijlocul lui {[round(v) for v in pose]}")
+            a.move(list(pose), 800)
+            return [round(v) for v in pose]
+        finally:
+            p.urgent = False
 
     def aim(self, rob, search=True, center=True):
         p = self.pipeline
@@ -554,7 +685,7 @@ class Runner:
         return self.thread is not None and self.thread.is_alive()
 
     def start(self, task):
-        if task not in ("task1", "task2", "aim", "rebuild"):
+        if task not in ("task1", "task2", "aim", "rebuild", "safe", "grip_find"):
             raise ValueError("Sarcină necunoscută")
         if self.busy():
             raise ValueError("O sarcină rulează deja")
@@ -570,7 +701,8 @@ class Runner:
             rob = Robot(should_stop=self.stop_ev.is_set, on_look=self.pipeline.set_grid)
             self.log(f"Pornesc {task} (braț {'simulat' if rob.sim else 'REAL'})")
             fn = {"task1": tasks.run_task1, "task2": tasks.run_task2, "aim": lambda r, ctx: ctx.memorize(r),
-                  "rebuild": lambda r, ctx: ctx.rebuild(r)}[task]
+                  "rebuild": lambda r, ctx: ctx.rebuild(r), "safe": lambda r, ctx: r.safe(),
+                  "grip_find": lambda r, ctx: ctx.grip_find(r)}[task]
             self.result = fn(rob, self)
             self.status = "gata"
         except Stopped:
@@ -605,7 +737,7 @@ class App:
         self.runner = Runner(self.pipeline)
         self.runner.on_memorize = self.memorize_step1
         self.mode = "task1"
-        self.memorized = None
+        self.memorized = (self.runner.memory or {}).get("colors")
         self.verify = None
         self.sim = arm_is_sim()
         threading.Thread(target=self.pipeline.run_stream, daemon=True, name="stream").start()
@@ -648,6 +780,7 @@ class App:
             "positions_missing": self.positions_missing(),
             "saved_corners": sorted(self.pipeline.saved),
             "arm": {"angles": LAST["angles"], "pad": self.pad.state()},
+            "grip": self.grip_state(),
         }
         if self.mode == "task2":
             s["plan2"] = self.preview_tower(p.get("stable"))
@@ -794,6 +927,68 @@ class App:
         self.runner.start("rebuild")
         return self.say("Pun cuburile înapoi pe caroiaj (orice buton de pe controller oprește)")
 
+    def a_safe(self, b):
+        self.runner.start("safe")
+        return self.say("Duc brațul în poziția sigură (orice buton de pe controller oprește)")
+
+    # --- calibrarea gripperului (gripcal.py)
+    def a_grip_find(self, b):
+        self.runner.start("grip_find")
+        return self.say("Caut cubul din fața brațului")
+
+    def a_grip_save(self, b):
+        if self.runner.busy():
+            raise ValueError("Brațul încă se mișcă: așteaptă să termine")
+        cube = self.runner.grip_cube
+        if not cube:
+            raise ValueError("Întâi „Găsește cubul”")
+        angles = Robot().read()
+        if None in angles:
+            raise ValueError("Nu am putut citi servourile; mai încearcă")
+        s = {"color": cube["color"], "xy": cube["xy"], "angles": [round(a, 1) for a in angles]}
+        samples = gripcal.load() + [s]
+        gripcal.save(samples)
+        self.runner.grip_cube = None
+        e = gripcal.error(s) * 100
+        return self.say(f"Salvat ({len(samples)} măsurători). Cu valorile de acum, gripperul calculat e la "
+                        f"({e[0]:+.1f}, {e[1]:+.1f}, {e[2]:+.1f}) cm de centrul cubului. Deschide gripperul, mută "
+                        "cubul în alt loc și „Găsește cubul”.")
+
+    def a_grip_delete(self, b):
+        samples = gripcal.load()
+        i = int(b.get("i", -1))
+        if not 0 <= i < len(samples):
+            raise ValueError("Măsurătoare inexistentă")
+        samples.pop(i)
+        gripcal.save(samples)
+        return self.say(f"Șters; au rămas {len(samples)} măsurători")
+
+    def a_grip_clear(self, b):
+        gripcal.save([])
+        self.runner.grip_cube = None
+        return self.say("Toate măsurătorile gripperului au fost șterse")
+
+    def a_grip_fit(self, b):
+        samples = gripcal.load()
+        r = gripcal.fit(samples)
+        gripcal.apply({k: r[k] for k in gripcal.KEYS + ("GRIP_PITCH",)})
+        return self.say(f"Aplicat: GRIP_LEN {r['GRIP_LEN'] * 100:.1f} cm, GRIP_UP {r['GRIP_UP'] * 100:+.1f} cm, "
+                        f"GRIP_SIDE {r['GRIP_SIDE'] * 100:+.1f} cm, GRIP_DZ {r['GRIP_DZ'] * 100:+.1f} cm. "
+                        + (f"Gripperul înclinat ca la calibrare: {r['GRIP_PITCH'][0] + r['GRIP_PITCH'][1] * 0.15:.0f}° la "
+                           f"15 cm, {r['GRIP_PITCH'][0] + r['GRIP_PITCH'][1] * 0.22:.0f}° la 22 cm. " if r["GRIP_PITCH"] else "")
+                        + f"Eroare rămasă {r['err'] * 100:.1f} cm pe "
+                        f"{len(samples)} măsurători" + (" (mai adaugă: cu una, înălțimea nu se poate afla)"
+                                                       if len(samples) < 2 else ""))
+
+    def grip_state(self):
+        out = []
+        for s in gripcal.load():
+            e = gripcal.error(s) * 100
+            out.append({"color": s["color"], "xy": [round(v * 100, 1) for v in s["xy"]], "angles": s["angles"],
+                        "err": [round(float(v), 1) for v in e]})
+        return {"cube": self.runner.grip_cube, "samples": out,
+                "params": {k: round(getattr(C, k) * 100, 1) for k in gripcal.KEYS}}
+
     def a_stop(self, b):
         self.runner.stop()
         return self.say("Oprire cerută (se oprește la următoarea mișcare)")
@@ -811,11 +1006,12 @@ class App:
         self.pipeline.reset()
         self.pipeline.set_grid("S")
         self.memorized = self.verify = self.runner.memory = None
+        save_memory(None)
         if not self.sim:
             try:
-                Robot().home()
-            except Exception as e:   # noqa: BLE001
-                return self.say(f"Resetat, dar brațul nu a mers la HOME: {e}")
+                self.runner.start("safe")
+            except ValueError as e:
+                return self.say(f"Resetat, dar brațul nu a mers în poziția sigură: {e}")
         return self.say("Resetat: sarcină oprită, memorie ștearsă, scena simulată refăcută")
 
     def a_camera(self, b):
@@ -1032,6 +1228,8 @@ def main():
     print(f"Camera: {APP.cam.source} | braț: {'simulat' if APP.sim else 'real'}")
     if C.HAT:
         print(hat.start())
+    if C.SAFE_ON_START and not APP.sim:
+        APP.runner.start("safe")
     print("Oprire: Ctrl+C")
     if open_browser:
         import webbrowser
