@@ -140,21 +140,28 @@ class Robot:
             return [90, 90, 90, 90, 90]
         raise KeyError(f"Poziția '{name}' nu e calibrată (rulează calibrate_arm.py)")
 
-    def move(self, angles, t=C.T_TRAVEL):
+    def move(self, angles, t=C.T_TRAVEL, via=()):
         """angles = [s1..s5]; gripperul rămâne cum e. Lin: puncte intermediare trimise la MOTION_HZ, cu profil
         minimum-jerk (fără smucitură la pornire și oprire), toate articulațiile ajung odată. Durata = t (unitatea
-        Arm_Lib), dar nu mai repede decât permit V_MAX / A_MAX. Stop îl oprește la următorul punct (≤ 25 ms)."""
+        Arm_Lib), dar nu mai repede decât permit V_MAX / A_MAX. via = unghiuri prin care trece pe drum (de ex.
+        kinematics.line: gripperul în linie dreaptă), tot cu un singur profil, fără opriri. Stop îl oprește la
+        următorul punct (≤ 25 ms)."""
         self.check()
         target = limit(angles)
-        start = self.last or self.current()
-        dist = max(abs(b - a) for a, b in zip(start, target))
+        pts = [self.last or self.current()] + [limit(v) for v in via or ()] + [target]
+        seg = [max(abs(b - a) for a, b in zip(p, q)) for p, q in zip(pts, pts[1:])]
+        dist = sum(seg)
         n = max(1, math.ceil(duration(dist, t) * C.MOTION_HZ))
         step_ms = int(2000 / C.MOTION_HZ)      # fiecare punct: atins în două perioade, ca mișcarea să nu stea
         t0 = time.time()
         for k in range(1, n + 1):
             self.check()
-            s = min_jerk(k / n)
-            self._send([a + (b - a) * s for a, b in zip(start, target)], step_ms)
+            d, i = min_jerk(k / n) * dist, 0       # cât din drum (grade) și pe a câta bucată a lui
+            while i < len(seg) - 1 and d > seg[i]:
+                d -= seg[i]
+                i += 1
+            s = min(1.0, d / seg[i]) if seg[i] else 1.0
+            self._send([a + (b - a) * s for a, b in zip(pts[i], pts[i + 1])], step_ms)
             if not self.sim or C.SIM_TIME_SCALE:
                 wait = t0 + k / C.MOTION_HZ * (C.SIM_TIME_SCALE if self.sim else 1) - time.time()
                 if wait > 0:
@@ -218,30 +225,45 @@ class Robot:
             print(f"  [SIM] atenție: nu era niciun cub de luat în {cell}")
         self.goto(f"{cell}_sus", C.T_DESCEND)
 
+    def descend(self, above, down):
+        """De deasupra, jos: gripperul în linie dreaptă (nu pe curba dintre unghiuri, care poate atinge foaia),
+        ultimii FINAL_DZ m încet (T_FINAL)."""
+        g = kinematics.grip(down)[0]
+        near = kinematics.ik(g + [0, 0, C.FINAL_DZ], math.degrees(kinematics.pitches(down)[2]), down[4])
+        if near is None:
+            self.move(down, C.T_DESCEND, kinematics.line(above, down))
+            return
+        self.move(near, C.T_DESCEND, kinematics.line(above, near))
+        self.move(down, C.T_FINAL)
+
     def grab_at(self, above, down):
         """Ia un cub de oriunde de pe masă (nu dintr-o celulă): above / down = unghiurile calculate de fetch.py.
         Întoarce True dacă cubul e în gripper."""
         self.gripper(C.GRIP_OPEN)
         self.move(above)
-        self.move(down, C.T_DESCEND)
+        self.descend(above, down)
         self.gripper(C.GRIP_CLOSE)
         if self.sim:
             WORLD.pick_at(*kinematics.grip(down))
         held = self.holding()
-        self.move(above, C.T_DESCEND)
+        self.move(above, C.T_DESCEND, kinematics.line(down, above))
         return held
 
     def place_at(self, above, down, cell=None):
         """Pune cubul din gripper oriunde pe masă: above / down = unghiurile calculate de fetch.py; cell = celula
-        caroiajului, dacă acolo îl pune (None = pe masă, de ex. pe locul de îndreptare)."""
-        self.move(above)
-        self.move(down, C.T_DESCEND)
-        self.gripper(C.GRIP_OPEN)
+        caroiajului, dacă acolo îl pune (None = pe masă, de ex. pe locul de îndreptare). Drumul până deasupra: la
+        înălțimea cea mai mare dintre plecare și sosire (kinematics.transit), deci cubul nu trece jos peste cuburile
+        puse; coborârea și urcarea în linie dreaptă; gripperul se deschide doar până la GRIP_RELEASE (larg împinge
+        cubul)."""
+        start = self.last or self.current()
+        self.move(above, C.T_TRAVEL, kinematics.transit(start, limit(above)))
+        self.descend(above, down)
+        self.gripper(C.GRIP_RELEASE)
         if self.sim and cell:
             WORLD.place(cell)
         elif self.sim:
             WORLD.drop_at(*kinematics.grip(down))
-        self.move(above, C.T_DESCEND)
+        self.move(above, C.T_DESCEND, kinematics.line(down, above))
 
     def holding(self):
         """E un cub în gripper? Pe brațul real: servo 6 s-a oprit înainte de GRIP_CLOSE (cubul îl ține)."""

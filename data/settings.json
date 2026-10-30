@@ -70,12 +70,13 @@
       ]
     ]
   },
-  "GRIP_DZ": -0.0528,
-  "GRIP_LEN": 0.086,
-  "GRIP_UP": -0.008,
+  "GRIP_DZ": -0.0547,
+  "GRIP_LEN": 0.084,
+  "GRIP_UP": -0.01,
   "GRIP_SIDE": -0.01,
   "GRIP_PITCH": [
     221.7,
     -512.9
-  ]
+  ],
+  "GRIP_DZ_R": 0.2
 }

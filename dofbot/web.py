@@ -70,8 +70,11 @@ def mean_hsv(frame, x, y, r=3):
     h, w = frame.shape[:2]
     x, y = int(min(max(x, 0), w - 1)), int(min(max(y, 0), h - 1))
     patch = frame[max(0, y - r):y + r + 1, max(0, x - r):x + r + 1]
-    hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV).reshape(-1, 3).mean(axis=0)
-    return [int(v) for v in hsv]
+    hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV).reshape(-1, 3).astype(np.float64)
+    # nuanța e pe cerc (0..179, roșul trece prin 0): media obișnuită dintre 2 și 177 ar da 90 (verde)
+    h = np.radians(hsv[:, 0] * 2)
+    hue = np.degrees(np.arctan2(np.sin(h).mean(), np.cos(h).mean())) / 2 % 180
+    return [int(round(hue)) % 180] + [int(v) for v in hsv[:, 1:].mean(axis=0)]
 
 
 def combine(colors, faces):
@@ -973,7 +976,10 @@ class App:
         r = gripcal.fit(samples)
         gripcal.apply({k: r[k] for k in gripcal.KEYS + ("GRIP_PITCH",)})
         return self.say(f"Aplicat: GRIP_LEN {r['GRIP_LEN'] * 100:.1f} cm, GRIP_UP {r['GRIP_UP'] * 100:+.1f} cm, "
-                        f"GRIP_SIDE {r['GRIP_SIDE'] * 100:+.1f} cm, GRIP_DZ {r['GRIP_DZ'] * 100:+.1f} cm. "
+                        f"GRIP_SIDE {r['GRIP_SIDE'] * 100:+.1f} cm, GRIP_DZ {r['GRIP_DZ'] * 100:+.1f} cm"
+                        f" ({r['GRIP_DZ_R'] * 5:+.1f} cm la fiecare 5 cm mai departe"
+                        + (", la limită: adaugă cuburi aproape și departe" if abs(r["GRIP_DZ_R"]) >= gripcal.DZ_R_MAX
+                           else "") + "). "
                         + (f"Gripperul înclinat ca la calibrare: {r['GRIP_PITCH'][0] + r['GRIP_PITCH'][1] * 0.15:.0f}° la "
                            f"15 cm, {r['GRIP_PITCH'][0] + r['GRIP_PITCH'][1] * 0.22:.0f}° la 22 cm. " if r["GRIP_PITCH"] else "")
                         + f"Eroare rămasă {r['err'] * 100:.1f} cm pe "

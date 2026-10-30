@@ -95,6 +95,9 @@ def run_task2(rob, ctx, target=None, order=None):
 
     t0 = time.time()
     ctx.log(f"Turn în {target}, de jos în sus: {' -> '.join(order)}")
+    learned = rob.sim or all({f"{k}_jos", f"{k}_sus"} <= set(rob.pos) for k in planner.grid_to_cells([[None] * 3] * 3))
+    if not learned and hasattr(ctx, "step1"):
+        return run_task2_camera(rob, ctx, target, order, t0)
     grid = look_and_detect(rob, ctx, "S", "s2_sursa.jpg")
     ctx.publish("source", grid)
     moves = planner.plan_tower(planner.grid_to_cells(grid), target, order)
@@ -114,3 +117,33 @@ def run_task2(rob, ctx, target=None, order=None):
     dt = time.time() - t0
     ctx.log(f"Turn gata în {dt:.1f} s")
     return {"moves": moves, "seconds": round(dt, 1)}
+
+
+def run_task2_camera(rob, ctx, target, order, t0):
+    """Sarcina 2 fără poziții învățate (din pagină): găsește caroiajul și culorile (ca la Sarcina 1, ctx.step1),
+    planifică turnul (planner.plan_tower) și îl construiește cu cinematica și camera (fetch.build_tower): fiecare cub
+    privit de aproape înainte de prindere, fiecare nivel țintit pe cubul de jos măsurat și verificat după punere."""
+    from . import fetch
+    first = ctx.step1(rob)
+    if ctx.grid_area is None:
+        raise RuntimeError("Nu știu unde e caroiajul pe masă: nu pot construi turnul")
+    cells = planner.grid_to_cells(first["colors"])
+    moves = planner.plan_tower(dict(cells), target, order)
+    ctx.publish("plan", moves)
+    ctx.log(f"Plan: {len(moves)} mutări")
+    if C.PAUSE_BETWEEN_PHASES:
+        ctx.pause(f"Plan gata ({len(moves)} mutări). Continuă pentru construcție.")
+    fetcher = fetch.Fetcher(rob, ctx.frame, ctx.log, ctx.grid_area)
+    fetcher.look = first["angles"]
+    pipeline = getattr(ctx, "pipeline", None)
+    if pipeline is not None:
+        pipeline.grid_off = True        # cât ia / pune cuburi, caroiajul nu se mai caută pe imagine
+    try:
+        report = fetch.build_tower(fetcher, ctx, cells, moves, target)
+    finally:
+        if pipeline is not None:
+            pipeline.grid_off = False
+    rob.move(first["angles"], 1500)
+    dt = time.time() - t0
+    ctx.log(f"Turn gata în {dt:.1f} s")
+    return dict(report, seconds=round(dt, 1))

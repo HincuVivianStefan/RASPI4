@@ -243,6 +243,11 @@ def auto_expose(cap, get_frame, log=print, tries=8):
         exp = exp / 2 if v >= 250 else exp * EXPOSE_TARGET / max(v, 5.0)
         exp = float(np.clip(exp, *EXPOSE_RANGE))
     C.apply_settings({"CAM_EXPOSURE": int(round(exp))})
+    # Și balansul de alb: cel găsit acum de cameră, lăsat fix (automat, schimbă culorile când brațul se mișcă).
+    wb = cap.get(cv2.CAP_PROP_WB_TEMPERATURE) if C.CAM_WB <= 0 else 0
+    if wb and wb > 0 and cap.set(cv2.CAP_PROP_AUTO_WB, 0) and cap.set(cv2.CAP_PROP_WB_TEMPERATURE, wb):
+        C.apply_settings({"CAM_WB": int(round(wb))})
+        log(f"  balans de alb fixat la {C.CAM_WB} K")
     return C.CAM_EXPOSURE
 
 

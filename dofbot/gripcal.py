@@ -23,7 +23,9 @@ SHOULDERS = (100, 112, 124, 134)    # și umărul (cotul, încheietura la 0): pr
 FIT_LEN = (0.08, 0.20)              # m: între ce valori se caută GRIP_LEN
 FIT_UP = 0.05                       # m: GRIP_UP între -atât și +atât
 FIT_SIDE = 0.03                     # m: GRIP_SIDE între -atât și +atât
-KEYS = ("GRIP_LEN", "GRIP_UP", "GRIP_SIDE", "GRIP_DZ")
+KEYS = ("GRIP_LEN", "GRIP_UP", "GRIP_SIDE", "GRIP_DZ", "GRIP_DZ_R")
+DZ_R_MIN = 0.05                     # m: GRIP_DZ_R se află doar din cuburi întinse pe cel puțin atâta (aproape–departe)
+DZ_R_MAX = 0.2                      # m pe m: și cel mult atât (1 cm la 5 cm): mai mult e zgomotul măsurătorilor
 
 
 def pitch_line(samples):
@@ -72,9 +74,10 @@ def target(sample):
     return np.array([sample["xy"][0], sample["xy"][1], C.FETCH_CUBE_M / 2])
 
 
-def model_point(angles, glen, gup, side, dz):
+def model_point(angles, glen, gup, side, dz, dz_r=0.0):
     w, d, up = kinematics.wrist(angles)
-    return w + glen * d + gup * up + side * kinematics.side(angles) + [0, 0, dz]
+    p = w + glen * d + gup * up + side * kinematics.side(angles)
+    return p + [0, 0, dz + dz_r * (np.hypot(*p[:2]) - C.GRIP_DZ_R0)]
 
 
 def error(sample, values=None):
@@ -85,8 +88,9 @@ def error(sample, values=None):
 
 
 def fit(samples):
-    """GRIP_LEN, GRIP_UP, GRIP_SIDE, GRIP_DZ (și eroarea rămasă, m) care duc punctul de prindere cel mai aproape de
-    centrele cuburilor (căutare pe grilă, toate măsurătorile odată). Cu o singură măsurătoare GRIP_DZ rămâne 0."""
+    """GRIP_LEN, GRIP_UP, GRIP_SIDE, GRIP_DZ, GRIP_DZ_R (și eroarea rămasă, m) care duc punctul de prindere cel mai
+    aproape de centrele cuburilor (căutare pe grilă, toate măsurătorile odată). Cu o singură măsurătoare GRIP_DZ
+    rămâne 0; GRIP_DZ_R doar cu cel puțin 3, întinse pe DZ_R_MIN, și cel mult DZ_R_MAX."""
     if not samples:
         raise ValueError("Nicio măsurătoare: găsește un cub, prinde-l din controller, apoi „Salvează prinderea”")
     L = np.arange(FIT_LEN[0], FIT_LEN[1] + 1e-9, 0.002)[:, None, None, None]
@@ -97,13 +101,23 @@ def fit(samples):
         w, d, up = kinematics.wrist(s["angles"])
         res.append(w - target(s) + L * d + U * up + S * kinematics.side(s["angles"]))
     res = np.stack(res)                                   # măsurătoare × lungime × sus × lateral × xyz
-    dz = -res[..., 2].mean(0) if len(samples) > 1 else np.zeros(res.shape[1:4])
-    res[..., 2] += dz
+    # distanța de bază a fiecărui punct calculat (minus GRIP_DZ_R0): înălțimea = GRIP_DZ + GRIP_DZ_R × aceasta
+    xy = np.float64([target(s)[:2] for s in samples])[:, None, None, None]
+    r = np.hypot(res[..., 0] + xy[..., 0], res[..., 1] + xy[..., 1]) - C.GRIP_DZ_R0
+    z = -res[..., 2]
+    if len(samples) >= 3 and np.ptp([np.hypot(*s["xy"]) for s in samples]) >= DZ_R_MIN:
+        rc = r - r.mean(0)
+        dz_r = np.clip((rc * (z - z.mean(0))).sum(0) / (rc ** 2).sum(0), -DZ_R_MAX, DZ_R_MAX)
+    else:
+        dz_r = np.zeros(res.shape[1:4])
+    dz = (z - dz_r * r).mean(0) if len(samples) > 1 else np.zeros(res.shape[1:4])
+    res[..., 2] += dz + dz_r * r
     err = np.sqrt((res ** 2).sum(-1).mean(0))
     i, j, k = np.unravel_index(np.argmin(err), err.shape)
     return {"GRIP_LEN": round(float(L[i, 0, 0, 0]), 4), "GRIP_UP": round(float(U[0, j, 0, 0]), 4),
             "GRIP_SIDE": round(float(S[0, 0, k, 0]), 4), "GRIP_DZ": round(float(dz[i, j, k]), 4),
-            "GRIP_PITCH": pitch_line(samples), "err": float(err[i, j, k])}
+            "GRIP_DZ_R": round(float(dz_r[i, j, k]), 4), "GRIP_PITCH": pitch_line(samples),
+            "err": float(err[i, j, k])}
 
 
 def apply(values):

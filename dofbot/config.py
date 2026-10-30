@@ -150,10 +150,19 @@ GRIP_LEN = 0.146          # încheietura → punctul dintre degetele gripperului
 GRIP_UP = 0.0             # m: punctul de prindere, în afara axei gripperului (spre „sus” al camerei); calibrare
 GRIP_SIDE = 0.0           # m: punctul de prindere, la dreapta camerei (camera montată puțin într-o parte); calibrare
 GRIP_DZ = 0.0             # m: brațul real ajunge cu atât mai sus decât modelul (umărul / servourile); calibrare
+GRIP_DZ_R = 0.0           # m pe m: și cu atât mai mult la fiecare metru mai departe de GRIP_DZ_R0 (întins, brațul se
+GRIP_DZ_R0 = 0.17         # lasă sub greutatea lui); din calibrarea gripperului, cu cuburi aproape și departe
+GRIP_DZ_RS = (0.135, 0.22)  # m: GRIP_DZ_R doar între aceste distanțe (cât acoperă măsurătorile din grip_samples.json:
+                            # rândul 3, la ~11 cm, extrapolat, era lăsat de prea sus și cădea)
 GRIP_PITCH = []           # [a, b]: înclinarea gripperului preferată la distanța r (m) de bază = a + b·r (grade; 180 =
                           # vertical): cum l-ai ținut la calibrare, unde valorile GRIP_* sunt bune. [] = cât mai vertical
 # GRIP_*: măsurate din pagină (Braț → Calibrare gripper, gripcal.py) și scrise în data/settings.json
-FETCH_LIFT = 0.05         # de unde privește cubul înainte să-l ia: atâția metri înapoi, de-a lungul gripperului
+FETCH_LIFT = 0.05         # poziția de deasupra cubului (de acolo coboară să-l ia / să-l pună): atâția metri mai sus
+LIFT_VERTICAL = True      # deasupra = pe verticală (coboară drept, nu trage foaia); False: înapoi de-a lungul gripperului
+FINAL_DZ = 0.01           # m: ultimii atâția până jos, coborâți încet (T_FINAL)                       # REGLEAZĂ
+T_FINAL = 700             # timpul ultimului centimetru (unitatea Arm_Lib)                           # REGLEAZĂ
+GRIP_RELEASE = 115        # la punere gripperul se deschide doar până aici (larg, cu GRIP_OPEN, împingea cubul;
+                          # pe cub: 135 nu-l mai strânge)                                              # REGLEAZĂ
 FETCH_TOL = 0.004         # m: poziția cubului e bună când două priviri de aproape diferă cu mai puțin de atât
 FETCH_OFFSET = [0.0, 0.0] # m, adunat la punctul de prindere (dinspre bază spre cub / la stânga lui), dacă brațul
                           # greșește mereu la fel (întâi: calibrarea gripperului din pagină, gripcal.py)
@@ -173,7 +182,7 @@ TUNABLE = ["COLORS", "LIGHT_NORM", "LIGHT_MAX_GAIN", "CAM_EXPOSURE", "CAM_GAIN",
            "GRID_MAX_RATIO",
            "MIN_FRACTION", "PATCH", "STABLE_FRAMES", "CUBE_MODE", "CUBE_MIN_AREA", "CUBE_MAX_AREA",
            "CUBE_MAX_ASPECT", "CUBE_MIN_FILL", "CUBE_3D", "CUBE_TOP", "CUBE_SIDE", "CAM_FOCAL", "PAUSE_BETWEEN_PHASES",
-           "GRIP_LEN", "GRIP_UP", "GRIP_SIDE", "GRIP_DZ", "GRIP_PITCH",
+           "GRIP_LEN", "GRIP_UP", "GRIP_SIDE", "GRIP_DZ", "GRIP_DZ_R", "GRIP_PITCH", "GRIP_RELEASE", "T_FINAL",
            "S1_ROW_ORDER", "S2_TARGET", "S2_ORDER", "SYNTH_LAYOUT"]
 _DEFAULTS = {k: copy.deepcopy(globals()[k]) for k in TUNABLE}
 

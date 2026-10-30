@@ -59,11 +59,18 @@ def camera_pose(angles):
     return pos, np.vstack([right, -up, d])
 
 
+def dz(r):
+    """Cât ajunge brațul real mai sus decât modelul, la r m de bază (GRIP_DZ, GRIP_DZ_R; în afara GRIP_DZ_RS, ca la
+    capătul lui: nu se extrapolează)."""
+    return C.GRIP_DZ + C.GRIP_DZ_R * (min(max(r, C.GRIP_DZ_RS[0]), C.GRIP_DZ_RS[1]) - C.GRIP_DZ_R0)
+
+
 def grip(angles):
     """(punctul dintre degetele gripperului, direcția în care se închid degetele; servo 5 le rotește)."""
     w, d, up = wrist(angles)
     _, _, right, _ = _rolled(angles, C.FETCH_ROLL_SIGN * ((angles[4] if len(angles) > 4 else 90) - 90))
-    return w + C.GRIP_LEN * d + C.GRIP_UP * up + C.GRIP_SIDE * side(angles) + [0, 0, C.GRIP_DZ], right
+    p = w + C.GRIP_LEN * d + C.GRIP_UP * up + C.GRIP_SIDE * side(angles)
+    return p + [0, 0, dz(np.hypot(*p[:2]))], right
 
 
 def fingers(angles):
@@ -98,7 +105,7 @@ def ik(point, pitch, roll=90.0):
     r = np.hypot(x, y)
     # încheietura, față de umăr: punctul de prindere e la GRIP_LEN pe gripper și GRIP_UP în afara axei lui
     px = r - C.GRIP_LEN * np.sin(t4) + C.GRIP_UP * np.cos(t4)
-    pz = z - C.GRIP_DZ - C.GRIP_LEN * np.cos(t4) - C.GRIP_UP * np.sin(t4) - BASE_H
+    pz = z - dz(np.hypot(*point[:2])) - C.GRIP_LEN * np.cos(t4) - C.GRIP_UP * np.sin(t4) - BASE_H
     D = (px * px + pz * pz - L1 * L1 - L2 * L2) / (2 * L1 * L2)
     if abs(D) > 1:
         return None
@@ -112,10 +119,11 @@ def ik(point, pitch, roll=90.0):
 
 
 def reach(point, lift=0.0, roll=90.0, pitches=None):
-    """(unghiurile de prindere, cele de deasupra = cu `lift` m înapoi de-a lungul gripperului, înclinarea): gripperul
-    cât mai aproape de înclinarea de la calibrare (GRIP_PITCH, acolo valorile GRIP_* sunt bune), altfel cât mai
-    vertical, de la 180° în jos până la FETCH_MIN_PITCH. pitches = doar aceste înclinări, în ordine. None dacă nu
-    ajunge deloc."""
+    """(unghiurile de prindere, cele de deasupra, înclinarea): gripperul cât mai aproape de înclinarea de la
+    calibrare (GRIP_PITCH, acolo valorile GRIP_* sunt bune), altfel cât mai vertical, de la 180° în jos până la
+    FETCH_MIN_PITCH, la prima la care ajunge și cu `lift` m înapoi de-a lungul gripperului. Deasupra = cu `lift` m
+    mai sus pe verticală (LIFT_VERTICAL: coboară drept, nu trage foaia; cu brațul întins nu încape: mai puțin, până
+    la 40%), altfel cea de-a lungul gripperului. pitches = doar aceste înclinări, în ordine. None dacă nu ajunge."""
     point = np.float64(point)
     base = 90 + np.degrees(np.arctan2(point[1], point[0]))
     if pitches is None and C.GRIP_PITCH:
@@ -125,10 +133,53 @@ def reach(point, lift=0.0, roll=90.0, pitches=None):
         pitches = range(180, C.FETCH_MIN_PITCH - 1, -5)
     for pitch in pitches:
         down = ik(point, pitch, roll)
-        up = ik(point - lift * direction(base, pitch), pitch, roll) if down else None
-        if up:
-            return down, up, pitch
+        axis = ik(point - lift * direction(base, pitch), pitch, roll) if down else None
+        if not axis:            # înclinarea se alege tot ca înainte (înălțimile sunt reglate pe ea)
+            continue
+        for k in (1, 0.8, 0.6, 0.4) if C.LIFT_VERTICAL else ():
+            up = ik(point + [0, 0, k * lift], pitch, roll)
+            if up:
+                return down, up, pitch
+        return down, axis, pitch
     return None
+
+
+def line(a, b, step=0.01):
+    """Unghiurile intermediare (fără capete) cu care punctul gripperului merge în linie dreaptă de la poziția `a` la
+    `b` (câte unul la `step` m), cu înclinarea și servo 5 trecând treptat de la cele din a la cele din b. Mișcarea
+    din unghi în unghi a servourilor duce gripperul pe o curbă (poate atinge foaia); pe acest drum, nu.
+    None dacă vreun punct nu e accesibil."""
+    pa, pb = grip(a)[0], grip(b)[0]
+    ta, tb = np.degrees(pitches(a)[2]), np.degrees(pitches(b)[2])
+    n = int(np.ceil(np.linalg.norm(pb - pa) / step))
+    out = []
+    for k in range(1, n):
+        s = k / n
+        q = ik(pa + (pb - pa) * s, ta + (tb - ta) * s, a[4] + (b[4] - a[4]) * s)
+        if q is None:
+            return None
+        out.append(q)
+    return out
+
+
+def transit(a, b, step=0.02):
+    """Ca line, dar la înălțimea celui mai sus dintre a și b: baza se rotește și brațul se întinde / strânge fără ca
+    gripperul (cu cubul) să coboare pe drum peste cuburile puse; la capăt coboară vertical. None dacă nu ajunge."""
+    pa, pb = grip(a)[0], grip(b)[0]
+    ta, tb = np.degrees(pitches(a)[2]), np.degrees(pitches(b)[2])
+    ra, rb = np.hypot(*pa[:2]), np.hypot(*pb[:2])
+    fa, fb = np.arctan2(pa[1], pa[0]), np.arctan2(pb[1], pb[0])
+    z = max(pa[2], pb[2])
+    n = int(np.ceil(max(abs(rb - ra), max(ra, rb) * abs(fb - fa), abs(pb[2] - pa[2])) / step))
+    out = []
+    for k in range(1, n):
+        s = k / n
+        r, f = ra + (rb - ra) * s, fa + (fb - fa) * s
+        q = ik([r * np.cos(f), r * np.sin(f), z], ta + (tb - ta) * s, a[4] + (b[4] - a[4]) * s)
+        if q is None:
+            return None
+        out.append(q)
+    return out
 
 
 def look_at(point, dist):
